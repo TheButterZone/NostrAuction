@@ -446,7 +446,7 @@ export default function App() {
             ⚡
           </div>
           <span className="text-lg font-bold tracking-tight text-white whitespace-nowrap">
-            SatsNsite <span className="text-amber-400 font-mono text-xs ml-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
+            NostrAuction <span className="text-amber-400 font-mono text-xs ml-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
           </span>
         </div>
 
