@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Zap, Radio, Shield, Terminal, Clock, Award, 
   ExternalLink, Copy, Check, RefreshCw, AlertCircle, 
@@ -30,17 +30,28 @@ interface RelayStatus {
 const DEFAULT_TEST_NEVENT = "nevent1qgspnzhy9x60m7m66rg9c6rhcwev0k66ahllj72xst799l2sar8wy7sqyz00g9htar9cly8nu9pag5ydrnjtvf0lra7qar4ts4jauyyuh0cavmdttpz";
 const DEFAULT_STARTING_BID = 250000;
 const DEFAULT_TARGET_BLOCK = 977136;
+const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
 
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
   "wss://relay.primal.net",
   "wss://relay.snort.social",
   "wss://bitcoiner.social",
-  "wss://relay.wellorder.net",
-  "wss://relay.nostrfy.org",
   "wss://relay.ditto.pub",
   "wss://relay.dreamith.to",
 ];
+
+function extractEventRefTags(ev: any): string[] {
+  const refs: string[] = [];
+  if (ev && Array.isArray(ev.tags)) {
+    for (const tag of ev.tags) {
+      if ((tag[0] === 'e' || tag[0] === 'E') && tag[1]) {
+        refs.push(tag[1]);
+      }
+    }
+  }
+  return refs;
+}
 
 export default function App() {
   // Parse URL parameters or defaults
@@ -67,13 +78,10 @@ export default function App() {
   const [authorPubkey, setAuthorPubkey] = useState<string>('');
 
   // Live Bitcoin Block Height
-  const [currentBlockHeight, setCurrentBlockHeight] = useState<number>(976900);
+  const [currentBlockHeight, setCurrentBlockHeight] = useState<number | null>(null);
   const [isLiveBlockFetching, setIsLiveBlockFetching] = useState<boolean>(true);
   const [blockFetchError, setBlockFetchError] = useState<string | null>(null);
-
-  // Simulation mode for testing
-  const [simulatedBlock, setSimulatedBlock] = useState<number>(976900);
-  const [useSimulationBlock, setUseSimulationBlock] = useState<boolean>(true);
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
 
   // Bids state
   const [bids, setBids] = useState<Bid[]>([]);
@@ -136,37 +144,35 @@ export default function App() {
   }, [neventInput]);
 
   // Fetch live bitcoin block height from mempool.space API
-  useEffect(() => {
-    const fetchBlockHeight = async () => {
-      try {
-        const res = await fetch('https://mempool.space/api/blocks/tip/height');
-        if (!res.ok) throw new Error("Failed to fetch block height");
-        const heightText = await res.text();
-        const height = parseInt(heightText.trim(), 10);
-        if (!isNaN(height)) {
-          setCurrentBlockHeight(height);
-          if (!useSimulationBlock && simulatedBlock < height) {
-            setSimulatedBlock(height);
-          }
-          setBlockFetchError(null);
-        }
-      } catch (err) {
-        console.warn("Mempool API fetch error, using simulator:", err);
-        setBlockFetchError("Using simulated block height (API offline)");
-      } finally {
-        setIsLiveBlockFetching(false);
+  const fetchBlockHeight = useCallback(async () => {
+    setIsLiveBlockFetching(true);
+    try {
+      const res = await fetch('https://mempool.space/api/blocks/tip/height', { cache: 'no-store' });
+      if (!res.ok) throw new Error("Failed to fetch block height");
+      const heightText = await res.text();
+      const height = parseInt(heightText.trim(), 10);
+      if (!isNaN(height) && height > 0) {
+        setCurrentBlockHeight(height);
+        setLastSyncedAt(Math.floor(Date.now() / 1000));
+        setBlockFetchError(null);
       }
-    };
-
-    fetchBlockHeight();
-    const interval = setInterval(fetchBlockHeight, 30000); // every 30s
-    return () => clearInterval(interval);
+    } catch (err) {
+      console.warn("Mempool API fetch error:", err);
+      setBlockFetchError("Mempool API unreachable");
+    } finally {
+      setIsLiveBlockFetching(false);
+    }
   }, []);
 
-  const activeBlockHeight = useSimulationBlock ? simulatedBlock : currentBlockHeight;
+  useEffect(() => {
+    fetchBlockHeight();
+    const interval = setInterval(fetchBlockHeight, BLOCK_POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [fetchBlockHeight]);
+
   const targetBlockNum = parseInt(targetBlockInput, 10) || DEFAULT_TARGET_BLOCK;
   const startingBidNum = parseInt(startingBidInput, 10) || DEFAULT_STARTING_BID;
-  const auctionClosed = activeBlockHeight >= targetBlockNum;
+  const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
   // Highest bid calculation
   const validBids = bids.filter(b => b.amountSats >= startingBidNum);
@@ -181,7 +187,7 @@ export default function App() {
     }
   }, [auctionClosed, highestBid, winnerNotified]);
 
-  // Connect to Relays WebSocket with dual root anchoring and bidirectional parent-child e-tag walking
+  // Connect to Relays WebSocket with dual root anchoring, bidirectional e/E-tag walking, and orphan queueing
   useEffect(() => {
     if (!decodedEventId) return;
 
@@ -204,6 +210,41 @@ export default function App() {
     const rootEventIds = latestPostEventId ? [decodedEventId, latestPostEventId] : [decodedEventId];
     const discoveredEventIds = new Set<string>(rootEventIds);
     const seenBidIds = new Set<string>();
+    const pendingByParentId = new Map<string, Array<{ ev: any; relayUrl: string }>>();
+
+    const acceptThreadEvent = (ws: WebSocket, ev: any, eventRefTags: string[], relayUrl: string) => {
+      parseAndAddBid(ev, relayUrl, seenBidIds);
+
+      const newlyDiscovered = !discoveredEventIds.has(ev.id);
+      discoveredEventIds.add(ev.id);
+
+      // Register event ID and its e/E-tag parents/children for bidirectional walking
+      const idsToQuery = [ev.id, ...eventRefTags];
+      idsToQuery.forEach(targetId => {
+        if (!discoveredEventIds.has(targetId)) {
+          discoveredEventIds.add(targetId);
+          if (ws.readyState === WebSocket.OPEN) {
+            const bidirLowerId = `auction_bidir_e_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
+            ws.send(JSON.stringify(["REQ", bidirLowerId, { kinds: [1, 1111], '#e': [targetId], limit: 150 }]));
+
+            const bidirUpperId = `auction_bidir_E_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
+            ws.send(JSON.stringify(["REQ", bidirUpperId, { kinds: [1, 1111], '#E': [targetId], limit: 150 }]));
+
+            const directIdSubId = `auction_id_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
+            ws.send(JSON.stringify(["REQ", directIdSubId, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
+          }
+        }
+      });
+
+      // Flush any out-of-order children waiting on this event ID
+      if (newlyDiscovered && pendingByParentId.has(ev.id)) {
+        const queued = pendingByParentId.get(ev.id) || [];
+        pendingByParentId.delete(ev.id);
+        for (const item of queued) {
+          acceptThreadEvent(ws, item.ev, extractEventRefTags(item.ev), item.relayUrl);
+        }
+      }
+    };
 
     decodedRelays.forEach(relayUrl => {
       try {
@@ -213,22 +254,21 @@ export default function App() {
         ws.onopen = () => {
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, error: undefined } : r));
           
-          // 1. Dual Root Subscription (#e and ids filters)
-          const subRootId = `auction_dual_roots_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootId, { kinds: [1], '#e': rootEventIds, limit: 300 }]));
+          // 1. Dual Root Subscriptions (#e, #E, and ids filters across kinds 1 and 1111)
+          const subRootLowerId = `auction_dual_roots_e_${Math.random().toString(36).substring(7)}`;
+          ws.send(JSON.stringify(["REQ", subRootLowerId, { kinds: [1, 1111], '#e': rootEventIds, limit: 300 }]));
+
+          const subRootUpperId = `auction_dual_roots_E_${Math.random().toString(36).substring(7)}`;
+          ws.send(JSON.stringify(["REQ", subRootUpperId, { kinds: [1, 1111], '#E': rootEventIds, limit: 300 }]));
 
           const subRootIdsId = `auction_dual_roots_ids_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootIdsId, { kinds: [1], ids: rootEventIds, limit: 100 }]));
+          ws.send(JSON.stringify(["REQ", subRootIdsId, { kinds: [1, 1111], ids: rootEventIds, limit: 100 }]));
 
           // 2. Author notes query if authorPubkey is known
           if (authorPubkey) {
             const subAuthorId = `auction_author_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", subAuthorId, { kinds: [1], authors: [authorPubkey], limit: 100 }]));
+            ws.send(JSON.stringify(["REQ", subAuthorId, { kinds: [1, 1111], authors: [authorPubkey], limit: 100 }]));
           }
-
-          // 3. General kind 1 stream query to ensure all intermediate and nested bids are captured
-          const subStreamId = `auction_stream_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subStreamId, { kinds: [1], limit: 200 }]));
         };
 
         ws.onmessage = (event) => {
@@ -236,46 +276,30 @@ export default function App() {
             const data = JSON.parse(event.data);
             if (Array.isArray(data) && data[0] === 'EVENT' && data[2]) {
               const ev = data[2];
-              
-              // Extract all e tags (both parent references and child references)
-              const eventETags: string[] = [];
-              if (ev.tags && Array.isArray(ev.tags)) {
-                for (const tag of ev.tags) {
-                  if (tag[0] === 'e' && tag[1]) {
-                    eventETags.push(tag[1]);
-                  }
-                }
-              }
+              const eventRefTags = extractEventRefTags(ev);
 
-              // Check if event belongs to thread graph (tags root event, any discovered event, or parent note, or is a root id)
-              let belongsToThread = rootEventIds.includes(ev.id) || rootEventIds.some(id => eventETags.includes(id));
+              // Check if event belongs to thread graph (tags root event, any discovered event, or is a root id)
+              let belongsToThread = rootEventIds.includes(ev.id) || rootEventIds.some(id => eventRefTags.includes(id));
               if (!belongsToThread) {
-                for (const etag of eventETags) {
-                  if (discoveredEventIds.has(etag)) {
+                for (const refTag of eventRefTags) {
+                  if (discoveredEventIds.has(refTag)) {
                     belongsToThread = true;
                     break;
                   }
                 }
               }
 
-              // If it belongs to thread, process and register all its e tags for bidirectional walking
               if (belongsToThread) {
-                parseAndAddBid(ev, relayUrl, seenBidIds);
-
-                // Register event ID and its e-tag parents/children for bidirectional walking using both #e and ids filters
-                const idsToQuery = [ev.id, ...eventETags];
-                idsToQuery.forEach(targetId => {
-                  if (!discoveredEventIds.has(targetId)) {
-                    discoveredEventIds.add(targetId);
-                    if (ws.readyState === WebSocket.OPEN) {
-                      const bidirectionalSubId = `auction_bidir_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-                      ws.send(JSON.stringify(["REQ", bidirectionalSubId, { kinds: [1], '#e': [targetId], limit: 150 }]));
-
-                      const directIdSubId = `auction_id_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-                      ws.send(JSON.stringify(["REQ", directIdSubId, { kinds: [1], ids: [targetId], limit: 50 }]));
-                    }
+                acceptThreadEvent(ws, ev, eventRefTags, relayUrl);
+              } else if (eventRefTags.length > 0 && !seenBidIds.has(ev.id)) {
+                // Queue until one of its referenced parent/thread events is discovered
+                for (const refTag of eventRefTags) {
+                  const list = pendingByParentId.get(refTag) || [];
+                  if (!list.some(item => item.ev.id === ev.id)) {
+                    list.push({ ev, relayUrl });
+                    pendingByParentId.set(refTag, list);
                   }
-                });
+                }
               }
 
               setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, messageCount: r.messageCount + 1 } : r));
@@ -556,7 +580,7 @@ export default function App() {
                 </div>
 
                 <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/60 col-span-2 sm:col-span-1">
-                  <span className="text-xs text-slate-400 font-mono block mb-1">Total Valid Bids</span>
+                  <span className="text-xs text-slate-400 font-mono block mb-1">Total Bids</span>
                   <span className="text-lg font-bold text-white font-mono tabular-nums">
                     {validBids.length}
                   </span>
@@ -592,73 +616,66 @@ export default function App() {
 
           </div>
 
-          {/* Right Col: Block Height & Countdown Tracker */}
+          {/* Right Col: Live Mempool.space Block Height Tracker */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800/80 p-6 flex flex-col justify-between shadow-xl">
             <div>
               <div className="flex items-center justify-between mb-4">
                 <span className="text-xs font-medium text-slate-400 font-mono uppercase tracking-wider flex items-center gap-1.5">
                   <Clock className="w-3.5 h-3.5 text-amber-400" /> Bitcoin Block Height
                 </span>
-                <span className="text-xs font-mono text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
-                  {useSimulationBlock ? 'SIMULATOR' : 'LIVE MEMPOOL'}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                    LIVE MEMPOOL
+                  </span>
+                  <button
+                    type="button"
+                    onClick={fetchBlockHeight}
+                    title="Refresh block height from mempool.space"
+                    className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLiveBlockFetching ? 'animate-spin text-amber-400' : ''}`} />
+                  </button>
+                </div>
               </div>
 
               <div className="bg-slate-950/70 p-5 rounded-xl border border-slate-800/80 mb-4 text-center">
                 <span className="text-xs text-slate-400 font-mono block mb-1">Current Chain Tip</span>
                 <div className="text-3xl font-bold font-mono text-white tabular-nums tracking-tight">
-                  #{activeBlockHeight.toLocaleString()}
+                  {currentBlockHeight !== null ? `#${currentBlockHeight.toLocaleString()}` : 'Syncing...'}
                 </div>
                 <div className="text-xs text-slate-400 mt-2 font-mono">
-                  {auctionClosed ? (
+                  {currentBlockHeight === null ? (
+                    <span>Syncing with mempool.space...</span>
+                  ) : auctionClosed ? (
                     <span className="text-amber-400 font-semibold">Auction Closed (Target Reached)</span>
                   ) : (
-                    <span>Blocks Remaining: <strong className="text-amber-400">{(targetBlockNum - activeBlockHeight).toLocaleString()}</strong></span>
+                    <span>Blocks Remaining: <strong className="text-amber-400">{(targetBlockNum - currentBlockHeight).toLocaleString()}</strong></span>
                   )}
                 </div>
               </div>
 
-              {/* Simulator & Test Controls */}
-              <div className="space-y-3 bg-slate-950/40 p-4 rounded-xl border border-slate-800/60">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-medium text-slate-300 font-mono">Simulator Mode</label>
-                  <input 
-                    type="checkbox" 
-                    checked={useSimulationBlock} 
-                    onChange={e => setUseSimulationBlock(e.target.checked)}
-                    className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
-                  />
+              <div className="bg-slate-950/40 p-4 rounded-xl border border-slate-800/60 space-y-2 text-xs font-mono text-slate-400">
+                <div className="flex justify-between">
+                  <span>Source</span>
+                  <a
+                    href="https://mempool.space/api/blocks/tip/height"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-amber-400 hover:underline"
+                  >
+                    mempool.space API
+                  </a>
                 </div>
-                {useSimulationBlock && (
-                  <div>
-                    <div className="flex justify-between text-xs text-slate-400 font-mono mb-1">
-                      <span>Simulate Height</span>
-                      <span className="text-amber-400 font-bold">#{simulatedBlock}</span>
-                    </div>
-                    <input 
-                      type="range" 
-                      min={targetBlockNum - 50} 
-                      max={targetBlockNum + 20} 
-                      value={simulatedBlock} 
-                      onChange={e => setSimulatedBlock(parseInt(e.target.value, 10))}
-                      className="w-full accent-amber-500 cursor-pointer"
-                    />
-                    <div className="flex justify-between items-center mt-2">
-                      <button 
-                        onClick={() => setSimulatedBlock(targetBlockNum - 1)}
-                        className="px-2 py-1 text-[11px] font-mono bg-slate-800 hover:bg-slate-700 rounded text-slate-300"
-                      >
-                        Set to #{targetBlockNum - 1}
-                      </button>
-                      <button 
-                        onClick={() => setSimulatedBlock(targetBlockNum)}
-                        className="px-2 py-1 text-[11px] font-mono bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded border border-amber-500/30"
-                      >
-                        Trigger Closure (#{targetBlockNum})
-                      </button>
-                    </div>
-                  </div>
-                )}
+                <div className="flex justify-between">
+                  <span>Poll Interval</span>
+                  <span className="text-slate-200">{BLOCK_POLL_INTERVAL_MS / 1000}s</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Last Synced</span>
+                  <span className="text-slate-200 tabular-nums">
+                    {lastSyncedAt ? new Date(lastSyncedAt * 1000).toLocaleTimeString() : 'Never'}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -851,7 +868,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-900/40 py-6 px-6 text-center text-xs text-slate-400 font-mono">
-        <p>SatsNsite Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
+        <p>NostrAuction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
       </footer>
 
       {/* Configuration & Tester Modal */}
