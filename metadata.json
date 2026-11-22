@@ -1,0 +1,6 @@
+{
+  "name": "SatsNsite // Nostr Bitcoin Auction Terminal",
+  "description": "Decentralized Nostr Bitcoin auction nsite with real-time relay bidding and block height closing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
