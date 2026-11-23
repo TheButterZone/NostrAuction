@@ -40,6 +40,7 @@ const DEFAULT_RELAYS = [
   "wss://bitcoiner.social",
   "wss://relay.ditto.pub",
   "wss://relay.dreamith.to",
+  "wss://poster.place/relay",
 ];
 
 function extractEventRefTags(ev: any): string[] {
