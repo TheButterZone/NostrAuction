@@ -7,7 +7,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Zap, Radio, Terminal, Clock, Award, 
   ExternalLink, Copy, Check, RefreshCw, AlertCircle, 
-  Settings2, CheckCircle2
+  Settings2, CheckCircle2, ShieldAlert
 } from 'lucide-react';
 import { nip19 } from 'nostr-tools';
 
@@ -124,6 +124,8 @@ export default function App() {
   // Live Bitcoin Block Height & Closing Block Timestamp
   const [currentBlockHeight, setCurrentBlockHeight] = useState<number | null>(null);
   const [closingBlockTimestamp, setClosingBlockTimestamp] = useState<number | null>(null);
+  const [wasLiveBeforeClose, setWasLiveBeforeClose] = useState<boolean>(true);
+  const [wsBlockConnected, setWsBlockConnected] = useState<boolean>(false);
   const [isLiveBlockFetching, setIsLiveBlockFetching] = useState<boolean>(true);
   const [blockFetchError, setBlockFetchError] = useState<string | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
@@ -134,10 +136,29 @@ export default function App() {
   const [isListening, setIsListening] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const [showTesterModal, setShowTesterModal] = useState<boolean>(false);
-  const [winnerNotified, setWinnerNotified] = useState<boolean>(false);
+  const [finalizedWinner, setFinalizedWinner] = useState<Bid | null>(null);
+  const [winnerDisplayedAt, setWinnerDisplayedAt] = useState<string | null>(null);
+  const [auctionFinalized, setAuctionFinalized] = useState<boolean>(false);
 
-  // WebSocket references
-  const wsRefs = useRef<{ [url: string]: WebSocket }>({});
+  // WebSocket & block-state refs
+  const stopRelayConnectionsRef = useRef<(() => void) | null>(null);
+  const bidsRef = useRef<Bid[]>([]);
+  const wasLiveBeforeCloseRef = useRef<boolean>(true);
+  const currentBlockHeightRef = useRef<number | null>(null);
+  const liveCloseLockedRef = useRef<boolean>(false);
+  const finalizationSnapshotRef = useRef<Bid[] | null>(null);
+  const finalizationStartedRef = useRef<boolean>(false);
+  const timestampFetchInFlightRef = useRef<boolean>(false);
+  const targetBlockNumRef = useRef<number>(DEFAULT_TARGET_BLOCK);
+  const initialBlockLoadedRef = useRef<boolean>(false);
+  const wsConnectedRef = useRef<boolean>(false);
+
+  const targetBlockNum = parseNonNegativeInt(targetBlockInput, DEFAULT_TARGET_BLOCK);
+  const startingBidNum = parseNonNegativeInt(startingBidInput, DEFAULT_STARTING_BID);
+
+  useEffect(() => {
+    targetBlockNumRef.current = targetBlockNum;
+  }, [targetBlockNum]);
 
   // Parse primary + optional secondary anchor relay hints using nostr-tools
   useEffect(() => {
@@ -173,46 +194,116 @@ export default function App() {
     }
   }, [neventInput, anchorInput]);
 
-  const targetBlockNum = parseNonNegativeInt(targetBlockInput, DEFAULT_TARGET_BLOCK);
-  const startingBidNum = parseNonNegativeInt(startingBidInput, DEFAULT_STARTING_BID);
-
-  // Reset winner notification if auction parameters change
+  // Reset auction-finalization state when the auction parameters change.
   useEffect(() => {
-    setWinnerNotified(false);
+    setFinalizedWinner(null);
+    setWinnerDisplayedAt(null);
+    setAuctionFinalized(false);
+    const alreadyPastClosingBlock = currentBlockHeightRef.current !== null && currentBlockHeightRef.current >= targetBlockNum;
+    setWasLiveBeforeClose(!alreadyPastClosingBlock);
+    wasLiveBeforeCloseRef.current = !alreadyPastClosingBlock;
+    liveCloseLockedRef.current = false;
+    finalizationSnapshotRef.current = null;
+    finalizationStartedRef.current = false;
+    timestampFetchInFlightRef.current = false;
+    initialBlockLoadedRef.current = currentBlockHeightRef.current !== null;
   }, [decodedEventId, anchorEventId, startingBidNum, targetBlockNum]);
 
-  // Fetch live bitcoin block height & target block timestamp from mempool.space API
+  const fetchClosingBlockTimestamp = useCallback(async (blockHeight: number): Promise<number | null> => {
+    try {
+      const hashRes = await fetch(`https://mempool.space/api/block-height/${blockHeight}`, { cache: 'no-store' });
+      if (!hashRes.ok) return null;
+      const blockHash = (await hashRes.text()).trim();
+      if (!blockHash) return null;
+      const blockRes = await fetch(`https://mempool.space/api/block/${blockHash}`, { cache: 'no-store' });
+      if (!blockRes.ok) return null;
+      const blockData = await blockRes.json();
+      if (typeof blockData.timestamp === 'number') return blockData.timestamp;
+      return null;
+    } catch (tsErr) {
+      console.warn("Failed to fetch closing block timestamp:", tsErr);
+      return null;
+    }
+  }, []);
+
+  // The first target-height observation freezes the bids already received by this browser.
+  // Later relay events are ignored, even if their Nostr created_at value is backdated.
+  const finalizeLiveAuction = useCallback((blockTimestamp: number) => {
+    if (finalizationStartedRef.current || !wasLiveBeforeCloseRef.current) return;
+    finalizationStartedRef.current = true;
+    setClosingBlockTimestamp(blockTimestamp);
+
+    const snapshot = finalizationSnapshotRef.current || bidsRef.current;
+    const winner = [...snapshot]
+      .filter(b => b.amountSats >= startingBidNum && b.createdAt <= blockTimestamp)
+      .sort(compareBidsDeterministic)[0] || null;
+
+    setFinalizedWinner(winner);
+    if (winner) {
+      // This is the browser's local display time, not a timestamp certified by Bitcoin or Nostr.
+      setWinnerDisplayedAt(new Date().toISOString());
+    }
+    setAuctionFinalized(true);
+    setShowTesterModal(false);
+    stopRelayConnectionsRef.current?.();
+  }, [startingBidNum]);
+
+  const applyObservedBlockHeight = useCallback((height: number, fromInitialLoad: boolean, observedBlockTimestamp?: number) => {
+    if (isNaN(height) || height <= 0) return;
+    currentBlockHeightRef.current = currentBlockHeightRef.current === null ? height : Math.max(currentBlockHeightRef.current, height);
+    setCurrentBlockHeight(prev => (prev === null || height > prev ? height : prev));
+    setLastSyncedAt(Math.floor(Date.now() / 1000));
+    setBlockFetchError(null);
+
+    // Let the initial HTTP tip check decide whether this page arrived after the close.
+    // A block-stream frame can arrive before that request finishes.
+    if (!fromInitialLoad && !initialBlockLoadedRef.current) return;
+
+    const target = targetBlockNumRef.current;
+    if (height >= target) {
+      if (fromInitialLoad) {
+        setWasLiveBeforeClose(false);
+        wasLiveBeforeCloseRef.current = false;
+      } else if (wasLiveBeforeCloseRef.current && !liveCloseLockedRef.current) {
+        liveCloseLockedRef.current = true;
+        finalizationSnapshotRef.current = [...bidsRef.current];
+      }
+
+      if (wasLiveBeforeCloseRef.current && liveCloseLockedRef.current) {
+        if (typeof observedBlockTimestamp === 'number') {
+          finalizeLiveAuction(observedBlockTimestamp);
+        } else if (!finalizationStartedRef.current && !timestampFetchInFlightRef.current) {
+          timestampFetchInFlightRef.current = true;
+          fetchClosingBlockTimestamp(target).then(timestamp => {
+            timestampFetchInFlightRef.current = false;
+            if (timestamp !== null) {
+              finalizeLiveAuction(timestamp);
+            }
+          });
+        }
+      } else {
+        // Historical page load: retain relay subscriptions so stored events can reach EOSE.
+        fetchClosingBlockTimestamp(target).then(timestamp => {
+          if (timestamp !== null) setClosingBlockTimestamp(timestamp);
+        });
+      }
+    } else {
+      setClosingBlockTimestamp(null);
+    }
+    initialBlockLoadedRef.current = true;
+  }, [fetchClosingBlockTimestamp, finalizeLiveAuction]);
+
+  // Single initial HTTP fetch on load (and manual refresh / low-frequency fallback)
   const fetchBlockHeight = useCallback(async () => {
     setIsLiveBlockFetching(true);
+    const isFirstLoad = !initialBlockLoadedRef.current;
     try {
       const res = await fetch('https://mempool.space/api/blocks/tip/height', { cache: 'no-store' });
       if (!res.ok) throw new Error("Failed to fetch block height");
       const heightText = await res.text();
       const height = parseInt(heightText.trim(), 10);
       if (!isNaN(height) && height > 0) {
-        setCurrentBlockHeight(height);
-        setLastSyncedAt(Math.floor(Date.now() / 1000));
-        setBlockFetchError(null);
-
-        if (height >= targetBlockNum) {
-          try {
-            const hashRes = await fetch(`https://mempool.space/api/block-height/${targetBlockNum}`, { cache: 'no-store' });
-            if (hashRes.ok) {
-              const blockHash = (await hashRes.text()).trim();
-              const blockRes = await fetch(`https://mempool.space/api/block/${blockHash}`, { cache: 'no-store' });
-              if (blockRes.ok) {
-                const blockData = await blockRes.json();
-                if (typeof blockData.timestamp === 'number') {
-                  setClosingBlockTimestamp(blockData.timestamp);
-                }
-              }
-            }
-          } catch (tsErr) {
-            console.warn("Failed to fetch closing block timestamp:", tsErr);
-          }
-        } else {
-          setClosingBlockTimestamp(null);
-        }
+        applyObservedBlockHeight(height, isFirstLoad);
       }
     } catch (err) {
       console.warn("Mempool API fetch error:", err);
@@ -220,17 +311,110 @@ export default function App() {
     } finally {
       setIsLiveBlockFetching(false);
     }
-  }, [targetBlockNum]);
+  }, [applyObservedBlockHeight]);
 
   useEffect(() => {
     fetchBlockHeight();
-    const interval = setInterval(fetchBlockHeight, BLOCK_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
   }, [fetchBlockHeight]);
+
+  // Instant block updates via mempool.space WebSocket with reconnect backoff (stable lifecycle)
+  useEffect(() => {
+    let closedByCleanup = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let fallbackPollTimer: ReturnType<typeof setInterval> | null = null;
+    let activeWs: WebSocket | null = null;
+
+    const setConnectedState = (connected: boolean) => {
+      wsConnectedRef.current = connected;
+      setWsBlockConnected(connected);
+    };
+
+    const connectBlockWs = () => {
+      if (closedByCleanup) return;
+      try {
+        const ws = new WebSocket('wss://mempool.space/api/v1/ws');
+        activeWs = ws;
+
+        ws.onopen = () => {
+          if (closedByCleanup || activeWs !== ws) {
+            ws.close();
+            return;
+          }
+          reconnectAttempt = 0;
+          setConnectedState(true);
+          setBlockFetchError(null);
+          setIsLiveBlockFetching(false);
+          ws.send(JSON.stringify({ action: "want", data: ["blocks"] }));
+        };
+
+        ws.onmessage = (event) => {
+          if (closedByCleanup || activeWs !== ws) return;
+          try {
+            const msg = JSON.parse(event.data);
+            if (typeof msg?.block?.height === 'number') {
+              applyObservedBlockHeight(msg.block.height, false, msg.block.timestamp);
+            } else if (typeof msg?.blocks?.height === 'number') {
+              applyObservedBlockHeight(msg.blocks.height, false);
+            } else if (Array.isArray(msg?.blocks) && msg.blocks.length > 0 && typeof msg.blocks[0]?.height === 'number') {
+              applyObservedBlockHeight(msg.blocks[0].height, false);
+            } else if (typeof msg?.['mempool-blocks'] !== 'undefined') {
+              setLastSyncedAt(Math.floor(Date.now() / 1000));
+            }
+          } catch (e) {
+            console.warn("Failed to parse mempool WS frame:", e);
+          }
+        };
+
+        ws.onerror = () => {
+          if (activeWs === ws) {
+            setConnectedState(false);
+          }
+        };
+
+        ws.onclose = () => {
+          if (activeWs === ws) {
+            activeWs = null;
+            setConnectedState(false);
+          }
+          if (closedByCleanup) return;
+          const delayMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
+          reconnectAttempt += 1;
+          reconnectTimer = setTimeout(connectBlockWs, delayMs);
+        };
+      } catch (e) {
+        setConnectedState(false);
+        if (!closedByCleanup) {
+          const delayMs = Math.min(1000 * Math.pow(2, reconnectAttempt), 30000);
+          reconnectAttempt += 1;
+          reconnectTimer = setTimeout(connectBlockWs, delayMs);
+        }
+      }
+    };
+
+    connectBlockWs();
+
+    fallbackPollTimer = setInterval(() => {
+      if (!closedByCleanup && !wsConnectedRef.current) {
+        fetchBlockHeight();
+      }
+    }, BLOCK_POLL_INTERVAL_MS);
+
+    return () => {
+      closedByCleanup = true;
+      setConnectedState(false);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (fallbackPollTimer) clearInterval(fallbackPollTimer);
+      if (activeWs && (activeWs.readyState === WebSocket.OPEN || activeWs.readyState === WebSocket.CONNECTING)) {
+        activeWs.close();
+      }
+    };
+  }, [applyObservedBlockHeight, fetchBlockHeight]);
 
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
-  // Deterministic bid classification & winner calculation
+  // Deterministic bid classification & winner calculation. A live auction uses its
+  // immutable finalized winner after the closing block has been witnessed.
   const sortedBids = [...bids].sort(compareBidsDeterministic);
 
   const validBids = sortedBids.filter(b => {
@@ -240,22 +424,24 @@ export default function App() {
   });
 
   const highestBid = validBids.length > 0 ? validBids[0] : null;
+  const displayedWinner = auctionClosed && wasLiveBeforeClose ? finalizedWinner : highestBid;
+  const showcaseBid = auctionClosed && wasLiveBeforeClose
+    ? (finalizedWinner || (!auctionFinalized ? highestBid : null))
+    : highestBid;
   const connectedRelays = relaysStatus.filter(r => r.connected);
-
-  // Check if auction closed and trigger winner notification
-  useEffect(() => {
-    if (auctionClosed && highestBid && !winnerNotified) {
-      setWinnerNotified(true);
-    }
-  }, [auctionClosed, highestBid, winnerNotified]);
 
   // Connect to Relays WebSocket with batched deduplicated ID walking & per-relay EOSE tracking
   useEffect(() => {
     if (!decodedEventId || decodedRelays.length === 0) return;
 
+    // A live auction already locked at its target block must never reconnect to relays.
+    if (liveCloseLockedRef.current) return;
+
     setIsListening(true);
     setBids([]);
+    bidsRef.current = [];
     const newWsRefs: { [url: string]: WebSocket } = {};
+    let stopped = false;
 
     const rootEventIds = Array.from(
       new Set([decodedEventId, anchorEventId].map(id => id.toLowerCase()).filter(Boolean))
@@ -271,7 +457,26 @@ export default function App() {
 
     let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const stopConnections = () => {
+      if (stopped) return;
+      stopped = true;
+      if (batchTimer !== null) {
+        clearTimeout(batchTimer);
+        batchTimer = null;
+      }
+      pendingBatchIds.clear();
+      Object.values(newWsRefs).forEach(sock => {
+        if (sock.readyState === WebSocket.OPEN || sock.readyState === WebSocket.CONNECTING) {
+          try { sock.close(); } catch (e) { console.warn("Failed to close relay socket:", e); }
+        }
+      });
+      setIsListening(false);
+      setRelaysStatus(prev => prev.map(r => ({ ...r, connected: false })));
+    };
+    stopRelayConnectionsRef.current = stopConnections;
+
     const markRelayEoseIfReady = (relayUrl: string) => {
+      if (stopped || liveCloseLockedRef.current) return;
       const pending = relayPendingSubs.get(relayUrl);
       if (!pending || pending.size === 0) {
         setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, eoseReceived: true } : r));
@@ -279,6 +484,7 @@ export default function App() {
     };
 
     const registerSubscription = (ws: WebSocket, relayUrl: string, subId: string, filter: Record<string, any>) => {
+      if (stopped || liveCloseLockedRef.current) return;
       activeSubRelayMap.set(subId, relayUrl);
       let setForRelay = relayPendingSubs.get(relayUrl);
       if (!setForRelay) {
@@ -295,6 +501,7 @@ export default function App() {
 
     const flushBatchedWalkIds = () => {
       batchTimer = null;
+      if (stopped || liveCloseLockedRef.current) return;
       if (pendingBatchIds.size === 0) return;
 
       const batch = Array.from(pendingBatchIds);
@@ -316,6 +523,7 @@ export default function App() {
     };
 
     const scheduleWalkTargets = (targets: string[]) => {
+      if (stopped || liveCloseLockedRef.current) return;
       let addedAny = false;
       for (const rawId of targets) {
         const targetId = rawId.toLowerCase();
@@ -331,6 +539,7 @@ export default function App() {
     };
 
     const acceptThreadEvent = (ev: any, eventRefTags: string[], relayUrl: string) => {
+      if (stopped || liveCloseLockedRef.current) return;
       const evId = ev.id.toLowerCase();
       parseAndAddBid({ ...ev, id: evId, pubkey: ev.pubkey.toLowerCase() }, relayUrl, seenEventIds);
 
@@ -356,6 +565,7 @@ export default function App() {
         newWsRefs[relayUrl] = ws;
 
         ws.onopen = () => {
+          if (stopped || liveCloseLockedRef.current) { ws.close(); return; }
           relayPendingSubs.set(relayUrl, new Set<string>());
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, eoseReceived: false, error: undefined } : r));
 
@@ -376,6 +586,7 @@ export default function App() {
         };
 
         ws.onmessage = (event) => {
+          if (stopped || liveCloseLockedRef.current) return;
           try {
             const data = JSON.parse(event.data);
             if (!Array.isArray(data)) return;
@@ -422,6 +633,7 @@ export default function App() {
         };
 
         ws.onerror = (err) => {
+          if (stopped) return;
           console.warn("Relay error:", relayUrl, err);
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: false, error: 'Connection error' } : r));
         };
@@ -434,22 +646,17 @@ export default function App() {
       }
     });
 
-    wsRefs.current = newWsRefs;
-
     return () => {
-      if (batchTimer !== null) {
-        clearTimeout(batchTimer);
+      stopConnections();
+      if (stopRelayConnectionsRef.current === stopConnections) {
+        stopRelayConnectionsRef.current = null;
       }
-      Object.values(wsRefs.current).forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close();
-        }
-      });
     };
   }, [decodedEventId, anchorEventId, decodedRelays, authorPubkey]);
 
   // Parse Nostr event content to extract bid amounts in satoshis across nested threads
   const parseAndAddBid = (ev: any, relayUrl: string, seenSet?: Set<string>) => {
+    if (liveCloseLockedRef.current) return;
     if (!ev || !ev.content || !ev.id || !ev.pubkey) return;
     const evId = ev.id.toLowerCase();
     if (seenSet && seenSet.has(evId)) return;
@@ -468,10 +675,10 @@ export default function App() {
         relayUrl: relayUrl
       };
 
-      setBids(prev => {
-        if (prev.some(b => b.id === newBid.id)) return prev;
-        return [...prev, newBid].sort(compareBidsDeterministic);
-      });
+      if (bidsRef.current.some(b => b.id === newBid.id)) return;
+      const nextBids = [...bidsRef.current, newBid].sort(compareBidsDeterministic);
+      bidsRef.current = nextBids;
+      setBids(nextBids);
     }
   };
 
@@ -520,6 +727,7 @@ export default function App() {
 
   // Helper to inject a simulated incoming bid for testing
   const injectSimulatedBid = (sats: number, name: string) => {
+    if (liveCloseLockedRef.current || auctionFinalized) return;
     const fakeId = `sim_${Math.random().toString(16).substring(2, 10)}`;
     const fakePubkey = `npub1${name.toLowerCase()}000000000000000000000000000000000000000000`;
     const simulatedBid: Bid = {
@@ -531,7 +739,9 @@ export default function App() {
       relayUrl: decodedRelays[0] || 'wss://relay.damus.io'
     };
 
-    setBids(prev => [...prev, simulatedBid].sort(compareBidsDeterministic));
+    const nextBids = [...bidsRef.current, simulatedBid].sort(compareBidsDeterministic);
+    bidsRef.current = nextBids;
+    setBids(nextBids);
   };
 
   // Generate shareable URL
@@ -575,77 +785,77 @@ export default function App() {
       {/* Top Bar Contract (1 row, 3 zones, gap-8) */}
       <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-slate-900/55 backdrop-blur-md sticky top-0 z-50">
         
-{/* Zone 1: Single text element wordmark */}
+        {/* Zone 1: Single text element wordmark */}
         <div className="flex items-center gap-3 shrink-0">
-<svg
-  xmlns="http://www.w3.org/2000/svg"
-  viewBox="0 0 64 64"
-  width="64"
-  height="64"
-  className="w-8 h-8 rounded-[14px] shrink-0"
-  aria-label="NostrAuction ostrich gavel icon"
->
-  <rect x="0" y="0" width="64" height="64" rx="14" fill="#EED9B5" />
-  <ellipse cx="36.5" cy="29" rx="13" ry="10.5" fill="#1E2022" />
-  <g transform="translate(13.5,18) rotate(-42)">
-    <rect x="-1.1" y="1.8" width="2.2" height="14.5" rx="0.8" fill="#6D4C41" stroke="#3E2723" strokeWidth="0.7" />
-    <rect x="-4.5" y="-1.8" width="9" height="3.6" rx="0.8" fill="#5D4037" stroke="#3E2723" strokeWidth="0.7" />
-    <rect x="-5.5" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
-    <rect x="3.9" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
-  </g>
-  <path
-    d="M30 23 C25 22.5 19.5 23.5 18 26.5 C17 29 21 31.5 27.5 31.5 C31.5 31.5 33 26.5 30 23 Z"
-    fill="#F5EFE0"
-    stroke="#454A52"
-    strokeWidth="1.1"
-    strokeLinejoin="round"
-  />
-  <path
-    d="M20.5 26.2 Q24.5 25.8 27.5 27.2"
-    fill="none"
-    stroke="#454A52"
-    strokeWidth="1"
-    strokeLinecap="round"
-  />
-  <path
-    d="M33.5 25.5 C31.5 24 30.5 26.5 32.5 28 C31 29 32.5 31.5 34.5 30.5 C35.5 32.5 38 32.5 39 30.5 C41 31.5 42.5 29 41 28 C43 26.5 42 24 40 25.5 Z"
-    fill="#F5EFE0"
-    stroke="#1E2022"
-    strokeWidth="1"
-    strokeLinejoin="round"
-  />
-  <path
-    d="M35 27 C36 22 40.5 19 37 14 C34.5 10.5 33.5 9 33.5 7 L37 7 C37 9 38 10.5 40.5 14 C44 19 39.5 22 38.5 27 Z"
-    fill="#F5EFE0"
-    stroke="#1E2022"
-    strokeWidth="1.1"
-    strokeLinejoin="round"
-  />
-  <path
-    d="M39 5.8 Q45 5.8 46 7.4 Q45 9 39 8.8 Z"
-    fill="#C9A9A6"
-    stroke="#1E2022"
-    strokeWidth="1"
-    strokeLinejoin="round"
-  />
-  <path d="M39.5 7.4 L45.5 7.4" stroke="#1E2022" strokeWidth="0.8" strokeLinecap="round" />
-  <path
-    d="M31.5 8.5 Q29.5 7.5 31 6 Q30 4.2 32 4.5 Q32 2.5 34 3.5 Q35 1.8 36.5 3.5 Q39 3.5 39.5 6.5 Q39.5 9.5 36 9.8 Q32.5 9.8 31.5 8.5 Z"
-    fill="#F5EFE0"
-    stroke="#1E2022"
-    strokeWidth="1.1"
-    strokeLinejoin="round"
-  />
-  <circle cx="36.3" cy="6.2" r="1.5" fill="#1E2022" />
-  <circle cx="36.7" cy="5.8" r="0.5" fill="#FFFFFF" />
-  <path
-    d="M7 36 L57 36 L53.5 59.5 Q53 60.5 52 60.5 L12 60.5 Q11 60.5 10.5 59.5 Z"
-    fill="#655A4E"
-    stroke="#807153"
-    strokeWidth="1.1"
-  />
-  <rect x="5" y="33.5" width="54" height="4.8" rx="1.8" fill="#655A4E" stroke="#807153" strokeWidth="1.1" />
-</svg>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 64 64"
+            width="64"
+            height="64"
+            className="w-8 h-8 rounded-[14px] shrink-0"
+            aria-label="NostrAuction ostrich gavel icon"
+          >
+            <rect x="0" y="0" width="64" height="64" rx="14" fill="#EED9B5" />
+            <ellipse cx="36.5" cy="29" rx="13" ry="10.5" fill="#1E2022" />
+            <g transform="translate(13.5,18) rotate(-42)">
+              <rect x="-1.1" y="1.8" width="2.2" height="14.5" rx="0.8" fill="#6D4C41" stroke="#3E2723" strokeWidth="0.7" />
+              <rect x="-4.5" y="-1.8" width="9" height="3.6" rx="0.8" fill="#5D4037" stroke="#3E2723" strokeWidth="0.7" />
+              <rect x="-5.5" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+              <rect x="3.9" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+            </g>
+            <path
+              d="M30 23 C25 22.5 19.5 23.5 18 26.5 C17 29 21 31.5 27.5 31.5 C31.5 31.5 33 26.5 30 23 Z"
+              fill="#F5EFE0"
+              stroke="#454A52"
+              strokeWidth="1.1"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M20.5 26.2 Q24.5 25.8 27.5 27.2"
+              fill="none"
+              stroke="#454A52"
+              strokeWidth="1"
+              strokeLinecap="round"
+            />
+            <path
+              d="M33.5 25.5 C31.5 24 30.5 26.5 32.5 28 C31 29 32.5 31.5 34.5 30.5 C35.5 32.5 38 32.5 39 30.5 C41 31.5 42.5 29 41 28 C43 26.5 42 24 40 25.5 Z"
+              fill="#F5EFE0"
+              stroke="#1E2022"
+              strokeWidth="1"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M35 27 C36 22 40.5 19 37 14 C34.5 10.5 33.5 9 33.5 7 L37 7 C37 9 38 10.5 40.5 14 C44 19 39.5 22 38.5 27 Z"
+              fill="#F5EFE0"
+              stroke="#1E2022"
+              strokeWidth="1.1"
+              strokeLinejoin="round"
+            />
+            <path
+              d="M39 5.8 Q45 5.8 46 7.4 Q45 9 39 8.8 Z"
+              fill="#C9A9A6"
+              stroke="#1E2022"
+              strokeWidth="1"
+              strokeLinejoin="round"
+            />
+            <path d="M39.5 7.4 L45.5 7.4" stroke="#1E2022" strokeWidth="0.8" strokeLinecap="round" />
+            <path
+              d="M31.5 8.5 Q29.5 7.5 31 6 Q30 4.2 32 4.5 Q32 2.5 34 3.5 Q35 1.8 36.5 3.5 Q39 3.5 39.5 6.5 Q39.5 9.5 36 9.8 Q32.5 9.8 31.5 8.5 Z"
+              fill="#F5EFE0"
+              stroke="#1E2022"
+              strokeWidth="1.1"
+              strokeLinejoin="round"
+            />
+            <circle cx="36.3" cy="6.2" r="1.5" fill="#1E2022" />
+            <circle cx="36.7" cy="5.8" r="0.5" fill="#FFFFFF" />
+            <path
+              d="M7 36 L57 36 L53.5 59.5 Q53 60.5 52 60.5 L12 60.5 Q11 60.5 10.5 59.5 Z"
+              fill="#655A4E"
+              stroke="#807153"
+              strokeWidth="1.1"
+            />
+            <rect x="5" y="33.5" width="54" height="4.8" rx="1.8" fill="#655A4E" stroke="#807153" strokeWidth="1.1" />
+          </svg>
           <span className="text-lg font-bold tracking-tight text-white whitespace-nowrap">
             NostrAuction <span className="text-amber-400 font-mono text-xs ml-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
           </span>
@@ -663,7 +873,8 @@ export default function App() {
         <div className="flex items-center gap-3 shrink-0">
           <button 
             onClick={() => setShowTesterModal(true)}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-lg transition-colors shadow-lg shadow-amber-400/10 whitespace-nowrap shrink-0 cursor-pointer"
+            disabled={auctionFinalized && wasLiveBeforeClose}
+            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg shadow-amber-400/10 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Settings2 className="w-3.5 h-3.5" />
             Configure Auction
@@ -675,8 +886,21 @@ export default function App() {
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col gap-8">
 
+        {/* Warning when page was not live before closing block was mined */}
+        {auctionClosed && !wasLiveBeforeClose && (
+          <div className="rounded-xl bg-amber-950/50 border border-amber-500/40 p-4 flex items-start gap-3 text-xs font-mono text-amber-200">
+            <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold uppercase tracking-wider text-amber-300 block mb-0.5">
+                Not Live-Witnessed Prior to Block #{targetBlockNum.toLocaleString()}
+              </span>
+              The closing block was already mined before this page loaded and reached the End of Stored Events (EOSE). Historical bid arrival times were not live-witnessed in real time — auctioneer judgment is advised.
+            </div>
+          </div>
+        )}
+
         {/* Winner / Auction Closed Notification Banner */}
-        {auctionClosed && highestBid && (
+        {auctionClosed && displayedWinner && (
           <div className="rounded-2xl bg-gradient-to-r from-emerald-950/80 via-slate-900 to-amber-950/50 border border-emerald-500/40 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
             <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
@@ -689,22 +913,27 @@ export default function App() {
                     <CheckCircle2 className="w-3.5 h-3.5" /> Auction Concluded at Block #{targetBlockNum}
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
-                    Winning Bid Confirmed: {highestBid.amountSats.toLocaleString()} sats ({formatBtc(highestBid.amountSats)})
+                    Winning Bid Confirmed: {displayedWinner.amountSats.toLocaleString()} sats ({formatBtc(displayedWinner.amountSats)})
                   </h2>
                   <p className="text-sm text-slate-300 mt-1">
-                    Winner Npub: <span className="font-mono text-amber-300">{truncatePubkey(highestBid.pubkey)}</span> · Event ID: <span className="font-mono text-slate-400 text-xs">{highestBid.id.substring(0, 16)}...</span>
+                    Winner Npub: <span className="font-mono text-amber-300">{truncatePubkey(displayedWinner.pubkey)}</span> · Event ID: <span className="font-mono text-slate-400 text-xs">{displayedWinner.id.substring(0, 16)}...</span>
                   </p>
                 </div>
               </div>
               <div className="flex items-center gap-3">
                 <a 
-                  href={`https://njump.me/${highestBid.id}`} 
+                  href={`https://njump.me/${displayedWinner.id}`} 
                   target="_blank" 
                   rel="noopener noreferrer"
                   className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-xl transition-colors shadow-lg shadow-emerald-600/20 whitespace-nowrap"
                 >
                   View Winning Note on Njump <ExternalLink className="w-3.5 h-3.5" />
                 </a>
+                {wasLiveBeforeClose && winnerDisplayedAt && (
+                  <span className="text-[11px] text-slate-400 font-mono whitespace-nowrap">
+                    Winner displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -799,8 +1028,12 @@ export default function App() {
                   <Clock className="w-3.5 h-3.5 text-amber-400" /> Bitcoin Block Height
                 </span>
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
-                    LIVE MEMPOOL
+                  <span className={`text-xs font-mono px-2 py-0.5 rounded border ${
+                    wsBlockConnected
+                      ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+                      : 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+                  }`}>
+                    {wsBlockConnected ? 'WS STREAM LIVE' : 'WS RECONNECTING'}
                   </span>
                   <button
                     type="button"
@@ -831,15 +1064,8 @@ export default function App() {
 
               <div className="bg-slate-950/40 p-4 rounded-xl border border-slate-800/60 space-y-2 text-xs font-mono text-slate-400">
                 <div className="flex justify-between">
-                  <span>Source</span>
-                  <a
-                    href="https://mempool.space/api/blocks/tip/height"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-amber-400 hover:underline"
-                  >
-                    mempool.space API
-                  </a>
+                  <span>Stream</span>
+                  <span className="text-amber-400">wss://mempool.space/api/v1/ws</span>
                 </div>
                 <div className="flex justify-between">
                   <span>Poll Interval</span>
@@ -851,19 +1077,11 @@ export default function App() {
                     {lastSyncedAt ? new Date(lastSyncedAt * 1000).toLocaleTimeString() : 'Never'}
                   </span>
                 </div>
-                {closingBlockTimestamp !== null && (
-                  <div className="flex justify-between">
-                    <span>Cutoff UTC</span>
-                    <span className="text-slate-200 tabular-nums">
-                      {new Date(closingBlockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 19)}Z
-                    </span>
-                  </div>
-                )}
               </div>
             </div>
 
-            <div className="text-[11px] text-slate-400 font-mono pt-4 border-t border-slate-800/60 text-center">
-              Mempool API: {isLiveBlockFetching ? 'Syncing...' : (blockFetchError || 'Connected ⚡')}
+            <div className="text-[11px] text-slate-400 font-mono pt-4 text-center">
+              Mempool WS: {wsBlockConnected ? 'Connected ⚡' : (blockFetchError || 'Reconnecting...')}
             </div>
           </div>
 
@@ -878,41 +1096,33 @@ export default function App() {
               </div>
               <h2 className="text-lg font-bold text-white tracking-tight">Current Highest Bidder</h2>
             </div>
-            <span className="text-xs font-mono text-amber-400 bg-amber-500/10 px-3 py-1 rounded-full border border-amber-500/20">
-              HIGHEST VALID BID
-            </span>
           </div>
 
-          {highestBid ? (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
-              <div className="md:col-span-2 space-y-3">
+          {showcaseBid ? (
+            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
+              <div className="space-y-3 flex-1">
                 <div className="text-3xl sm:text-4xl font-bold font-mono text-amber-400 tabular-nums tracking-tight">
-                  {highestBid.amountSats.toLocaleString()} <span className="text-lg font-normal text-slate-300">sats</span>
-                  <span className="text-sm font-normal text-slate-400 ml-3">({formatBtc(highestBid.amountSats)})</span>
+                  {(showcaseBid as Bid).amountSats.toLocaleString()} <span className="text-lg font-normal text-slate-300">sats</span>
+                  <span className="text-sm font-normal text-slate-400 ml-3">({formatBtc((showcaseBid as Bid).amountSats)})</span>
                 </div>
                 <p className="text-sm text-slate-300 bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 italic font-mono">
-                  "{highestBid.content}"
+                  "{(showcaseBid as Bid).content}"
                 </p>
                 <div className="flex flex-wrap items-center gap-4 text-xs text-slate-400 font-mono">
-                  <span>Bidder: <strong className="text-slate-200">{truncatePubkey(highestBid.pubkey)}</strong></span>
+                  <span>Bidder: <strong className="text-slate-200">{truncatePubkey((showcaseBid as Bid).pubkey)}</strong></span>
                   <span>·</span>
-                  <span>Relay: <strong className="text-slate-200">{highestBid.relayUrl.replace('wss://', '')}</strong></span>
+                  <span>Relay: <strong className="text-slate-200">{(showcaseBid as Bid).relayUrl.replace('wss://', '')}</strong></span>
                   <span>·</span>
-                  <span>Time: <strong className="text-slate-200">{new Date(highestBid.createdAt * 1000).toLocaleTimeString()}</strong></span>
+                  <span>Time: <strong className="text-slate-200">{new Date((showcaseBid as Bid).createdAt * 1000).toLocaleTimeString()}</strong></span>
                 </div>
               </div>
 
-              <div className="flex flex-col items-center justify-center bg-slate-950/60 p-6 rounded-xl border border-slate-800/80 text-center">
-                <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 mb-3">
-                  <Award className="w-6 h-6" />
-                </div>
-                <span className="text-xs font-mono text-slate-400 uppercase">Leading Status</span>
-                <span className="text-sm font-bold text-emerald-400 mt-1">Valid & Verified</span>
+              <div className="shrink-0">
                 <a
-                  href={`https://njump.me/${highestBid.id}`}
+                  href={`https://njump.me/${(showcaseBid as Bid).id}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="mt-4 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700 flex items-center gap-1.5"
+                  className="px-4 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700 flex items-center gap-1.5"
                 >
                   Inspect Note <ExternalLink className="w-3 h-3" />
                 </a>
@@ -925,7 +1135,8 @@ export default function App() {
               <p className="text-xs text-slate-400 mt-1 font-mono">Waiting for relay replies or use the tester panel to simulate bids.</p>
               <button
                 onClick={() => injectSimulatedBid(275000, "Satoshi")}
-                className="mt-4 px-4 py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-lg transition-colors shadow-lg"
+                disabled={liveCloseLockedRef.current}
+                className="mt-4 px-4 py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg"
               >
                 Simulate First Bid (275,000 sats)
               </button>
@@ -955,7 +1166,7 @@ export default function App() {
                 {sortedBids.map((bid) => {
                   const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
                   const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
-                  const isHighest = highestBid && highestBid.id === bid.id;
+                  const isHighest = displayedWinner && displayedWinner.id === bid.id;
                   return (
                     <div 
                       key={bid.id}
@@ -1038,7 +1249,8 @@ export default function App() {
               </p>
               <button
                 onClick={() => setShowTesterModal(true)}
-                className="mt-3 w-full py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 rounded-lg transition-colors shadow-md"
+                disabled={auctionFinalized && wasLiveBeforeClose}
+                className="mt-3 w-full py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-md"
               >
                 Open Testing Panel
               </button>
@@ -1071,6 +1283,25 @@ export default function App() {
             </div>
 
             <div className="space-y-4">
+              {/* Live-Witness Warning */}
+              <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-4 space-y-2">
+                <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
+                  <span>⚠</span>
+                  <span>IMPORTANT: KEEP THIS AUCTION TAB OPEN</span>
+                </div>
+                <p className="text-xs text-amber-100/90 leading-relaxed">
+                  To enable Live-Witnessed finalization, open this auction before its closing block is mined and keep this tab open, pinned, and connected to Mempool until the auction closes.
+                </p>
+                <ul className="list-disc pl-5 space-y-1 text-xs text-amber-100/90 leading-relaxed">
+                  <li>Do not close, refresh, or navigate away from this tab.</li>
+                  <li>Keep your browser running and your device awake.</li>
+                  <li>Keep an eye on the Mempool WS connection status.</li>
+                </ul>
+                <p className="text-xs text-amber-200 font-semibold leading-relaxed">
+                  If you open or reload the auction after its closing block has been mined, the auction cannot be Live-Witnessed. The winner may display with a Not Live-Witnessed caveat.
+                </p>
+              </div>
+
               <div>
                 <label className="block text-xs font-mono text-slate-300 mb-1">Auction Event (nevent / note1 / ID)</label>
                 <input
@@ -1141,6 +1372,7 @@ export default function App() {
                     onClick={() => {
                       injectSimulatedBid(320000, "CyberSatoshi");
                     }}
+                    disabled={liveCloseLockedRef.current}
                     className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center"
                   >
                     Bid 320,000 sats
@@ -1149,6 +1381,7 @@ export default function App() {
                     onClick={() => {
                       injectSimulatedBid(400000, "LightningWhale");
                     }}
+                    disabled={liveCloseLockedRef.current}
                     className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center"
                   >
                     Bid 400,000 sats
