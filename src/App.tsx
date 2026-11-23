@@ -28,10 +28,10 @@ interface RelayStatus {
 }
 
 const DEFAULT_TEST_NEVENT = "nevent1qgspnzhy9x60m7m66rg9c6rhcwev0k66ahllj72xst799l2sar8wy7sqyz00g9htar9cly8nu9pag5ydrnjtvf0lra7qar4ts4jauyyuh0cavmdttpz";
-const LATEST_THREAD_NEVENT = "nevent1qgsflquxnjhuleknfccdgczyhjqa6fqgtzef58mt7yhyfm7gcm2nwesqyqqqpllv9krk349gadc6j4vy6nu0zqu29zcs76u9get3x97t0jevjpr855h";
 const DEFAULT_STARTING_BID = 250000;
 const DEFAULT_TARGET_BLOCK = 977136;
 const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
+const MAX_DYNAMIC_WALK_TARGETS = 100;
 
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
@@ -76,6 +76,14 @@ function decodeNeventDetails(input: string): { id: string; relays: string[]; aut
   return { id: '', relays: [], author: '' };
 }
 
+function parseNonNegativeInt(raw: string, fallback: number): number {
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  const parsed = parseInt(trimmed, 10);
+  if (isNaN(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
 export default function App() {
   // Parse URL parameters or defaults
   const [neventInput, setNeventInput] = useState<string>(() => {
@@ -83,20 +91,26 @@ export default function App() {
     return params.get('nevent') || params.get('e') || DEFAULT_TEST_NEVENT;
   });
 
+  const [anchorInput, setAnchorInput] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('anchor') || '';
+  });
+
   const [startingBidInput, setStartingBidInput] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
     const start = params.get('start') || params.get('starting_bid') || params.get('bid');
-    return start ? start : String(DEFAULT_STARTING_BID);
+    return start !== null ? start : String(DEFAULT_STARTING_BID);
   });
 
   const [targetBlockInput, setTargetBlockInput] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
     const block = params.get('block') || params.get('height') || params.get('closing_block');
-    return block ? block : String(DEFAULT_TARGET_BLOCK);
+    return block !== null ? block : String(DEFAULT_TARGET_BLOCK);
   });
 
   // Decoded event details
   const [decodedEventId, setDecodedEventId] = useState<string>('');
+  const [anchorEventId, setAnchorEventId] = useState<string>('');
   const [decodedRelays, setDecodedRelays] = useState<string[]>(DEFAULT_RELAYS);
   const [authorPubkey, setAuthorPubkey] = useState<string>('');
 
@@ -118,11 +132,11 @@ export default function App() {
   // WebSocket references
   const wsRefs = useRef<{ [url: string]: WebSocket }>({});
 
-  // Parse nevent + anchor thread relay hints using nostr-tools
+  // Parse primary + optional secondary anchor relay hints using nostr-tools
   useEffect(() => {
     try {
       const primary = decodeNeventDetails(neventInput);
-      const secondary = decodeNeventDetails(LATEST_THREAD_NEVENT);
+      const secondary = anchorInput.trim() ? decodeNeventDetails(anchorInput) : { id: '', relays: [], author: '' };
 
       const eventId = primary.id || "7f70b7952e379bc5943b7e7a7a58a74b1e4c32b535d4f3b7d8b53d4f3b7d8b53";
       const normalizedRelays = Array.from(
@@ -134,6 +148,7 @@ export default function App() {
       );
 
       setDecodedEventId(eventId);
+      setAnchorEventId(secondary.id);
       setDecodedRelays(normalizedRelays);
       setAuthorPubkey(primary.author || secondary.author || '');
 
@@ -145,13 +160,19 @@ export default function App() {
     } catch (err) {
       console.error("Failed to decode nevent:", err);
       setDecodedEventId(neventInput);
+      setAnchorEventId('');
       setDecodedRelays(DEFAULT_RELAYS);
       setRelaysStatus(DEFAULT_RELAYS.map(url => ({ url, connected: false, messageCount: 0 })));
     }
-  }, [neventInput]);
+  }, [neventInput, anchorInput]);
 
-  const targetBlockNum = parseInt(targetBlockInput, 10) || DEFAULT_TARGET_BLOCK;
-  const startingBidNum = parseInt(startingBidInput, 10) || DEFAULT_STARTING_BID;
+  const targetBlockNum = parseNonNegativeInt(targetBlockInput, DEFAULT_TARGET_BLOCK);
+  const startingBidNum = parseNonNegativeInt(startingBidInput, DEFAULT_STARTING_BID);
+
+  // Reset winner notification if auction parameters change
+  useEffect(() => {
+    setWinnerNotified(false);
+  }, [decodedEventId, anchorEventId, startingBidNum, targetBlockNum]);
 
   // Fetch live bitcoin block height & target block timestamp from mempool.space API
   const fetchBlockHeight = useCallback(async () => {
@@ -202,7 +223,7 @@ export default function App() {
 
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
-  // Highest bid calculation (enforcing closing block timestamp cutoff when mined)
+  // Highest bid calculation (enforcing starting bid & closing block timestamp cutoff when mined)
   const validBids = bids.filter(b => {
     if (b.amountSats < startingBidNum) return false;
     if (closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp) return false;
@@ -226,7 +247,7 @@ export default function App() {
     }
   }, [auctionClosed, highestBid, winnerNotified]);
 
-  // Connect to Relays WebSocket with dual root anchoring, active parent fetching, and bidirectional e/E-tag walking
+  // Connect to Relays WebSocket with root anchoring, active parent fetching, and bidirectional e/E-tag walking
   useEffect(() => {
     if (!decodedEventId || decodedRelays.length === 0) return;
 
@@ -234,9 +255,8 @@ export default function App() {
     setBids([]);
     const newWsRefs: { [url: string]: WebSocket } = {};
 
-    const secondaryDecoded = decodeNeventDetails(LATEST_THREAD_NEVENT);
     const rootEventIds = Array.from(
-      new Set([decodedEventId, secondaryDecoded.id].filter(Boolean))
+      new Set([decodedEventId, anchorEventId].filter(Boolean))
     );
 
     const discoveredEventIds = new Set<string>(rootEventIds);
@@ -246,14 +266,27 @@ export default function App() {
 
     const queryTargetAcrossSockets = (targetId: string) => {
       if (!targetId || queriedIds.has(targetId)) return;
+      if (queriedIds.size >= MAX_DYNAMIC_WALK_TARGETS) return;
       queriedIds.add(targetId);
 
       Object.values(newWsRefs).forEach(sock => {
         if (sock.readyState === WebSocket.OPEN) {
           const suffix = `${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-          sock.send(JSON.stringify(["REQ", `auction_bidir_e_${suffix}`, { kinds: [1, 1111], '#e': [targetId], limit: 200 }]));
-          sock.send(JSON.stringify(["REQ", `auction_bidir_E_${suffix}`, { kinds: [1, 1111], '#E': [targetId], limit: 200 }]));
-          sock.send(JSON.stringify(["REQ", `auction_id_${suffix}`, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
+          const subE = `auction_bidir_e_${suffix}`;
+          const subUpperE = `auction_bidir_E_${suffix}`;
+          const subId = `auction_id_${suffix}`;
+
+          sock.send(JSON.stringify(["REQ", subE, { kinds: [1, 1111], '#e': [targetId], limit: 200 }]));
+          sock.send(JSON.stringify(["REQ", subUpperE, { kinds: [1, 1111], '#E': [targetId], limit: 200 }]));
+          sock.send(JSON.stringify(["REQ", subId, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
+
+          setTimeout(() => {
+            if (sock.readyState === WebSocket.OPEN) {
+              sock.send(JSON.stringify(["CLOSE", subE]));
+              sock.send(JSON.stringify(["CLOSE", subUpperE]));
+              sock.send(JSON.stringify(["CLOSE", subId]));
+            }
+          }, 8000);
         }
       });
     };
@@ -365,7 +398,7 @@ export default function App() {
         }
       });
     };
-  }, [decodedEventId, decodedRelays, authorPubkey]);
+  }, [decodedEventId, anchorEventId, decodedRelays, authorPubkey]);
 
   // Parse Nostr event content to extract bid amounts in satoshis across nested threads
   const parseAndAddBid = (ev: any, relayUrl: string, seenSet?: Set<string>) => {
@@ -395,49 +428,42 @@ export default function App() {
 
   const extractSatsFromText = (text: string): number | null => {
     const cleanText = text.toLowerCase().replace(/,/g, '');
-    
-    // Match shorthand like "500k", "1.5m", "425k", "650k", "660k"
-    const kMatch = cleanText.match(/(\d*\.?\d+)\s*k\b/);
-    if (kMatch) {
-      const num = parseFloat(kMatch[1]);
-      if (!isNaN(num)) return Math.round(num * 1000);
-    }
 
-    const mMatch = cleanText.match(/(\d*\.?\d+)\s*m\b/);
-    if (mMatch) {
-      const num = parseFloat(mMatch[1]);
-      if (!isNaN(num)) return Math.round(num * 1000000);
-    }
-
-    // Match patterns like "300,000 sats", "300000sat", "0.003 btc"
-    const satsMatch = cleanText.match(/(\d+)\s*(sats|sat|satoshis)/);
-    if (satsMatch) {
-      return parseInt(satsMatch[1], 10);
-    }
-
-    const btcMatch = cleanText.match(/(\d*\.?\d+)\s*btc/);
+    // 1. Explicit BTC amount (e.g. "0.005 btc", "0.01btc")
+    const btcMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*btc\b/);
     if (btcMatch) {
       const btc = parseFloat(btcMatch[1]);
-      return Math.round(btc * 100000000);
+      if (!isNaN(btc) && btc > 0 && btc < 21000000) {
+        return Math.round(btc * 100000000);
+      }
     }
 
-    // Match short auction bid shorthands like "430", "450", "680" as thousands if between 250 and 999
-    const shortNumMatch = cleanText.match(/\b([2-9]\d{2})\b/);
-    if (shortNumMatch) {
-      const val = parseInt(shortNumMatch[1], 10);
-      if (val >= 250 && val <= 999) return val * 1000;
+    // 2. Explicit sats / sat / satoshis
+    const satsMatch = cleanText.match(/(?:^|[^\w.])(\d+)\s*(?:sats?|satoshis?)\b/);
+    if (satsMatch) {
+      const sats = parseInt(satsMatch[1], 10);
+      if (!isNaN(sats) && sats > 0) return sats;
     }
 
-    // Match single digit like "5" or "5.0" meaning 500k in context of 450k -> 500k
-    if (cleanText.trim() === '5' || cleanText.includes(' 5 ') || cleanText.startsWith('5 ') || cleanText === '5.0') {
-      return 500000;
+    // 3. Explicit "k" thousands shorthand (e.g. "650k", "1.25k", "50k")
+    const kMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*k\b/);
+    if (kMatch) {
+      const num = parseFloat(kMatch[1]);
+      if (!isNaN(num) && num > 0) return Math.round(num * 1000);
     }
 
-    // Fallback: check if there is a standalone large number >= 10000
-    const numbers = cleanText.match(/\b\d{5,10}\b/g);
-    if (numbers && numbers.length > 0) {
-      const val = parseInt(numbers[0], 10);
-      if (val >= 10000) return val;
+    // 4. Explicit "m" millions shorthand (e.g. "1m", "1.5m")
+    const mMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*m\b/);
+    if (mMatch) {
+      const num = parseFloat(mMatch[1]);
+      if (!isNaN(num) && num > 0) return Math.round(num * 1000000);
+    }
+
+    // 5. Fallback: standalone integer >= 1,000,000 (avoids small numbers, block heights like 977136, etc.)
+    const largeNumbers = cleanText.match(/\b\d{7,10}\b/g);
+    if (largeNumbers && largeNumbers.length > 0) {
+      const val = parseInt(largeNumbers[0], 10);
+      if (!isNaN(val) && val >= 1000000) return val;
     }
 
     return null;
@@ -463,6 +489,9 @@ export default function App() {
   const generateShareUrl = () => {
     const url = new URL(window.location.origin + window.location.pathname);
     url.searchParams.set('nevent', neventInput);
+    if (anchorInput.trim()) {
+      url.searchParams.set('anchor', anchorInput.trim());
+    }
     url.searchParams.set('start', startingBidInput);
     url.searchParams.set('block', targetBlockInput);
     return url.toString();
@@ -947,11 +976,23 @@ export default function App() {
                 />
               </div>
 
+              <div>
+                <label className="block text-xs font-mono text-slate-300 mb-1">Optional Thread Anchor (nevent / note1 / ID)</label>
+                <input
+                  type="text"
+                  value={anchorInput}
+                  onChange={e => setAnchorInput(e.target.value)}
+                  placeholder="Leave blank unless anchoring a secondary thread event"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-mono text-slate-300 mb-1">Starting Bid (sats)</label>
                   <input
                     type="number"
+                    min={0}
                     value={startingBidInput}
                     onChange={e => setStartingBidInput(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
@@ -961,6 +1002,7 @@ export default function App() {
                   <label className="block text-xs font-mono text-slate-300 mb-1">Closing Block Height</label>
                   <input
                     type="number"
+                    min={0}
                     value={targetBlockInput}
                     onChange={e => setTargetBlockInput(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
@@ -974,6 +1016,7 @@ export default function App() {
                 <button
                   onClick={() => {
                     setNeventInput(DEFAULT_TEST_NEVENT);
+                    setAnchorInput('');
                     setStartingBidInput(String(DEFAULT_STARTING_BID));
                     setTargetBlockInput(String(DEFAULT_TARGET_BLOCK));
                     setShowTesterModal(false);
@@ -1020,9 +1063,13 @@ export default function App() {
               <button
                 onClick={() => {
                   setShowTesterModal(false);
-                  // Update URL search params
                   const url = new URL(window.location.href);
                   url.searchParams.set('nevent', neventInput);
+                  if (anchorInput.trim()) {
+                    url.searchParams.set('anchor', anchorInput.trim());
+                  } else {
+                    url.searchParams.delete('anchor');
+                  }
                   url.searchParams.set('start', startingBidInput);
                   url.searchParams.set('block', targetBlockInput);
                   window.history.pushState({}, '', url.toString());
