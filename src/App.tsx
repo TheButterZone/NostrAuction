@@ -23,7 +23,7 @@ interface Bid {
 interface RelayStatus {
   url: string;
   connected: boolean;
-  messageCount: number;
+  eoseReceived: boolean;
   error?: string;
 }
 
@@ -31,7 +31,7 @@ const DEFAULT_TEST_NEVENT = "nevent1qgspnzhy9x60m7m66rg9c6rhcwev0k66ahllj72xst79
 const DEFAULT_STARTING_BID = 250000;
 const DEFAULT_TARGET_BLOCK = 977136;
 const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
-const MAX_DYNAMIC_WALK_TARGETS = 100;
+const BATCH_FLUSH_DELAY_MS = 120;
 
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
@@ -47,7 +47,7 @@ function extractEventRefTags(ev: any): string[] {
   if (ev && Array.isArray(ev.tags)) {
     for (const tag of ev.tags) {
       if ((tag[0] === 'e' || tag[0] === 'E') && tag[1]) {
-        refs.push(tag[1]);
+        refs.push(tag[1].toLowerCase());
       }
     }
   }
@@ -60,15 +60,15 @@ function decodeNeventDetails(input: string): { id: string; relays: string[]; aut
     const decoded = nip19.decode(trimmed);
     if (decoded.type === 'nevent') {
       return {
-        id: decoded.data.id,
+        id: decoded.data.id.toLowerCase(),
         relays: decoded.data.relays || [],
-        author: decoded.data.author || '',
+        author: decoded.data.author ? decoded.data.author.toLowerCase() : '',
       };
     }
   } else if (trimmed.startsWith('note1')) {
     const decoded = nip19.decode(trimmed);
     if (decoded.type === 'note') {
-      return { id: decoded.data, relays: [], author: '' };
+      return { id: decoded.data.toLowerCase(), relays: [], author: '' };
     }
   } else if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
     return { id: trimmed.toLowerCase(), relays: [], author: '' };
@@ -82,6 +82,12 @@ function parseNonNegativeInt(raw: string, fallback: number): number {
   const parsed = parseInt(trimmed, 10);
   if (isNaN(parsed) || parsed < 0) return fallback;
   return parsed;
+}
+
+function compareBidsDeterministic(a: Bid, b: Bid): number {
+  if (b.amountSats !== a.amountSats) return b.amountSats - a.amountSats;
+  if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+  return a.id.localeCompare(b.id);
 }
 
 export default function App() {
@@ -155,14 +161,14 @@ export default function App() {
       setRelaysStatus(normalizedRelays.map(url => ({
         url,
         connected: false,
-        messageCount: 0
+        eoseReceived: false
       })));
     } catch (err) {
       console.error("Failed to decode nevent:", err);
       setDecodedEventId(neventInput);
       setAnchorEventId('');
       setDecodedRelays(DEFAULT_RELAYS);
-      setRelaysStatus(DEFAULT_RELAYS.map(url => ({ url, connected: false, messageCount: 0 })));
+      setRelaysStatus(DEFAULT_RELAYS.map(url => ({ url, connected: false, eoseReceived: false })));
     }
   }, [neventInput, anchorInput]);
 
@@ -223,22 +229,17 @@ export default function App() {
 
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
-  // Highest bid calculation (enforcing starting bid & closing block timestamp cutoff when mined)
-  const validBids = bids.filter(b => {
+  // Deterministic bid classification & winner calculation
+  const sortedBids = [...bids].sort(compareBidsDeterministic);
+
+  const validBids = sortedBids.filter(b => {
     if (b.amountSats < startingBidNum) return false;
     if (closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp) return false;
     return true;
   });
 
-  const highestBid = validBids.length > 0 
-    ? validBids.reduce((max, b) => {
-        if (b.amountSats !== max.amountSats) {
-          return b.amountSats > max.amountSats ? b : max;
-        }
-        // Earlier timestamp wins ties
-        return b.createdAt < max.createdAt ? b : max;
-      }, validBids[0])
-    : null;
+  const highestBid = validBids.length > 0 ? validBids[0] : null;
+  const connectedRelays = relaysStatus.filter(r => r.connected);
 
   // Check if auction closed and trigger winner notification
   useEffect(() => {
@@ -247,7 +248,7 @@ export default function App() {
     }
   }, [auctionClosed, highestBid, winnerNotified]);
 
-  // Connect to Relays WebSocket with root anchoring, active parent fetching, and bidirectional e/E-tag walking
+  // Connect to Relays WebSocket with batched deduplicated ID walking & per-relay EOSE tracking
   useEffect(() => {
     if (!decodedEventId || decodedRelays.length === 0) return;
 
@@ -256,60 +257,92 @@ export default function App() {
     const newWsRefs: { [url: string]: WebSocket } = {};
 
     const rootEventIds = Array.from(
-      new Set([decodedEventId, anchorEventId].filter(Boolean))
+      new Set([decodedEventId, anchorEventId].map(id => id.toLowerCase()).filter(Boolean))
     );
 
     const discoveredEventIds = new Set<string>(rootEventIds);
-    const queriedIds = new Set<string>(rootEventIds);
-    const seenBidIds = new Set<string>();
+    const queuedWalkIds = new Set<string>(rootEventIds);
+    const pendingBatchIds = new Set<string>();
+    const seenEventIds = new Set<string>();
     const pendingByParentId = new Map<string, Array<{ ev: any; relayUrl: string }>>();
+    const activeSubRelayMap = new Map<string, string>(); // subId -> relayUrl
+    const relayPendingSubs = new Map<string, Set<string>>(); // relayUrl -> Set<subId>
 
-    const queryTargetAcrossSockets = (targetId: string) => {
-      if (!targetId || queriedIds.has(targetId)) return;
-      if (queriedIds.size >= MAX_DYNAMIC_WALK_TARGETS) return;
-      queriedIds.add(targetId);
+    let batchTimer: ReturnType<typeof setTimeout> | null = null;
 
-      Object.values(newWsRefs).forEach(sock => {
+    const markRelayEoseIfReady = (relayUrl: string) => {
+      const pending = relayPendingSubs.get(relayUrl);
+      if (!pending || pending.size === 0) {
+        setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, eoseReceived: true } : r));
+      }
+    };
+
+    const registerSubscription = (ws: WebSocket, relayUrl: string, subId: string, filter: Record<string, any>) => {
+      activeSubRelayMap.set(subId, relayUrl);
+      let setForRelay = relayPendingSubs.get(relayUrl);
+      if (!setForRelay) {
+        setForRelay = new Set<string>();
+        relayPendingSubs.set(relayUrl, setForRelay);
+      }
+      setForRelay.add(subId);
+      setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, eoseReceived: false } : r));
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(["REQ", subId, filter]));
+      }
+    };
+
+    const flushBatchedWalkIds = () => {
+      batchTimer = null;
+      if (pendingBatchIds.size === 0) return;
+
+      const batch = Array.from(pendingBatchIds);
+      pendingBatchIds.clear();
+
+      const batchToken = `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+
+      Object.entries(newWsRefs).forEach(([relayUrl, sock]) => {
         if (sock.readyState === WebSocket.OPEN) {
-          const suffix = `${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-          const subE = `auction_bidir_e_${suffix}`;
-          const subUpperE = `auction_bidir_E_${suffix}`;
-          const subId = `auction_id_${suffix}`;
+          const subE = `walk_e_${batchToken}`;
+          const subUpperE = `walk_E_${batchToken}`;
+          const subIds = `walk_ids_${batchToken}`;
 
-          sock.send(JSON.stringify(["REQ", subE, { kinds: [1, 1111], '#e': [targetId], limit: 200 }]));
-          sock.send(JSON.stringify(["REQ", subUpperE, { kinds: [1, 1111], '#E': [targetId], limit: 200 }]));
-          sock.send(JSON.stringify(["REQ", subId, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
-
-          setTimeout(() => {
-            if (sock.readyState === WebSocket.OPEN) {
-              sock.send(JSON.stringify(["CLOSE", subE]));
-              sock.send(JSON.stringify(["CLOSE", subUpperE]));
-              sock.send(JSON.stringify(["CLOSE", subId]));
-            }
-          }, 8000);
+          registerSubscription(sock, relayUrl, subE, { kinds: [1, 1111], '#e': batch, limit: 500 });
+          registerSubscription(sock, relayUrl, subUpperE, { kinds: [1, 1111], '#E': batch, limit: 500 });
+          registerSubscription(sock, relayUrl, subIds, { kinds: [1, 1111], ids: batch, limit: 250 });
         }
       });
     };
 
-    const acceptThreadEvent = (ev: any, eventRefTags: string[], relayUrl: string) => {
-      parseAndAddBid(ev, relayUrl, seenBidIds);
+    const scheduleWalkTargets = (targets: string[]) => {
+      let addedAny = false;
+      for (const rawId of targets) {
+        const targetId = rawId.toLowerCase();
+        if (!targetId || queuedWalkIds.has(targetId)) continue;
+        queuedWalkIds.add(targetId);
+        pendingBatchIds.add(targetId);
+        addedAny = true;
+      }
 
-      const newlyDiscovered = !discoveredEventIds.has(ev.id);
-      discoveredEventIds.add(ev.id);
+      if (addedAny && batchTimer === null) {
+        batchTimer = setTimeout(flushBatchedWalkIds, BATCH_FLUSH_DELAY_MS);
+      }
+    };
+
+    const acceptThreadEvent = (ev: any, eventRefTags: string[], relayUrl: string) => {
+      const evId = ev.id.toLowerCase();
+      parseAndAddBid({ ...ev, id: evId, pubkey: ev.pubkey.toLowerCase() }, relayUrl, seenEventIds);
+
+      const newlyDiscovered = !discoveredEventIds.has(evId);
+      discoveredEventIds.add(evId);
 
       // Walk both the event's own ID (for child replies) and all its e/E references (for parent/root events)
-      const idsToWalk = [ev.id, ...eventRefTags];
-      idsToWalk.forEach(targetId => {
-        if (!discoveredEventIds.has(targetId)) {
-          discoveredEventIds.add(targetId);
-        }
-        queryTargetAcrossSockets(targetId);
-      });
+      scheduleWalkTargets([evId, ...eventRefTags]);
 
       // Flush any out-of-order children waiting on this event ID
-      if (newlyDiscovered && pendingByParentId.has(ev.id)) {
-        const queued = pendingByParentId.get(ev.id) || [];
-        pendingByParentId.delete(ev.id);
+      if (newlyDiscovered && pendingByParentId.has(evId)) {
+        const queued = pendingByParentId.get(evId) || [];
+        pendingByParentId.delete(evId);
         for (const item of queued) {
           acceptThreadEvent(item.ev, extractEventRefTags(item.ev), item.relayUrl);
         }
@@ -322,54 +355,65 @@ export default function App() {
         newWsRefs[relayUrl] = ws;
 
         ws.onopen = () => {
-          setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, error: undefined } : r));
+          relayPendingSubs.set(relayUrl, new Set<string>());
+          setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, eoseReceived: false, error: undefined } : r));
 
           const allKnownIds = Array.from(discoveredEventIds);
+          const initToken = Math.random().toString(36).substring(2, 8);
 
-          // 1. Subscribe to #e, #E, and direct ids for all known root/discovered thread events
-          const subRootLowerId = `auction_roots_e_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootLowerId, { kinds: [1, 1111], '#e': allKnownIds, limit: 500 }]));
-
-          const subRootUpperId = `auction_roots_E_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootUpperId, { kinds: [1, 1111], '#E': allKnownIds, limit: 500 }]));
-
-          const subRootIdsId = `auction_roots_ids_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootIdsId, { kinds: [1, 1111], ids: allKnownIds, limit: 200 }]));
+          // 1. Batched root subscriptions (#e, #E, and direct ids across kinds 1 and 1111)
+          registerSubscription(ws, relayUrl, `roots_e_${initToken}`, { kinds: [1, 1111], '#e': allKnownIds, limit: 500 });
+          registerSubscription(ws, relayUrl, `roots_E_${initToken}`, { kinds: [1, 1111], '#E': allKnownIds, limit: 500 });
+          registerSubscription(ws, relayUrl, `roots_ids_${initToken}`, { kinds: [1, 1111], ids: allKnownIds, limit: 250 });
 
           // 2. Author notes query if authorPubkey is known
           if (authorPubkey) {
-            const subAuthorId = `auction_author_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", subAuthorId, { kinds: [1, 1111], authors: [authorPubkey], limit: 200 }]));
+            registerSubscription(ws, relayUrl, `author_${initToken}`, { kinds: [1, 1111], authors: [authorPubkey], limit: 250 });
           }
+
+          markRelayEoseIfReady(relayUrl);
         };
 
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            if (Array.isArray(data) && data[0] === 'EVENT' && data[2]) {
+            if (!Array.isArray(data)) return;
+
+            if (data[0] === 'EOSE' && typeof data[1] === 'string') {
+              const subId = data[1];
+              const subRelay = activeSubRelayMap.get(subId) || relayUrl;
+              const pending = relayPendingSubs.get(subRelay);
+              if (pending) {
+                pending.delete(subId);
+              }
+              markRelayEoseIfReady(subRelay);
+              return;
+            }
+
+            if (data[0] === 'EVENT' && data[2]) {
               const ev = data[2];
+              if (!ev.id || !ev.pubkey) return;
+              const evId = ev.id.toLowerCase();
               const eventRefTags = extractEventRefTags(ev);
 
               // Check if event belongs to thread graph (is a root/discovered ID or tags any root/discovered ID)
-              let belongsToThread =
-                discoveredEventIds.has(ev.id) ||
+              const belongsToThread =
+                discoveredEventIds.has(evId) ||
                 eventRefTags.some(refTag => discoveredEventIds.has(refTag));
 
               if (belongsToThread) {
                 acceptThreadEvent(ev, eventRefTags, relayUrl);
-              } else if (eventRefTags.length > 0 && !seenBidIds.has(ev.id)) {
-                // Queue until one of its referenced parent/thread events arrives, and actively query those parent IDs
+              } else if (eventRefTags.length > 0 && !seenEventIds.has(evId)) {
+                // Queue until one of its referenced parent/thread events arrives, and batch-query those parent IDs
                 for (const refTag of eventRefTags) {
                   const list = pendingByParentId.get(refTag) || [];
-                  if (!list.some(item => item.ev.id === ev.id)) {
+                  if (!list.some(item => item.ev.id.toLowerCase() === evId)) {
                     list.push({ ev, relayUrl });
                     pendingByParentId.set(refTag, list);
                   }
-                  queryTargetAcrossSockets(refTag);
                 }
+                scheduleWalkTargets(eventRefTags);
               }
-
-              setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, messageCount: r.messageCount + 1 } : r));
             }
           } catch (e) {
             console.error("Error parsing WS message from", relayUrl, e);
@@ -392,6 +436,9 @@ export default function App() {
     wsRefs.current = newWsRefs;
 
     return () => {
+      if (batchTimer !== null) {
+        clearTimeout(batchTimer);
+      }
       Object.values(wsRefs.current).forEach(ws => {
         if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
           ws.close();
@@ -403,25 +450,26 @@ export default function App() {
   // Parse Nostr event content to extract bid amounts in satoshis across nested threads
   const parseAndAddBid = (ev: any, relayUrl: string, seenSet?: Set<string>) => {
     if (!ev || !ev.content || !ev.id || !ev.pubkey) return;
-    if (seenSet && seenSet.has(ev.id)) return;
-    if (seenSet) seenSet.add(ev.id);
+    const evId = ev.id.toLowerCase();
+    if (seenSet && seenSet.has(evId)) return;
+    if (seenSet) seenSet.add(evId);
 
     const content = ev.content;
     const amount = extractSatsFromText(content);
 
     if (amount && amount > 0) {
       const newBid: Bid = {
-        id: ev.id,
-        pubkey: ev.pubkey,
+        id: evId,
+        pubkey: ev.pubkey.toLowerCase(),
         content: content,
         amountSats: amount,
-        createdAt: ev.created_at || Math.floor(Date.now() / 1000),
+        createdAt: typeof ev.created_at === 'number' ? ev.created_at : Math.floor(Date.now() / 1000),
         relayUrl: relayUrl
       };
 
       setBids(prev => {
         if (prev.some(b => b.id === newBid.id)) return prev;
-        return [newBid, ...prev];
+        return [...prev, newBid].sort(compareBidsDeterministic);
       });
     }
   };
@@ -445,7 +493,7 @@ export default function App() {
       if (!isNaN(sats) && sats > 0) return sats;
     }
 
-    // 3. Explicit "k" thousands shorthand (e.g. "650k", "1.25k", "50k")
+    // 3. Explicit "k" thousands shorthand (e.g. "650k", "680k", "1.25k")
     const kMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*k\b/);
     if (kMatch) {
       const num = parseFloat(kMatch[1]);
@@ -482,7 +530,7 @@ export default function App() {
       relayUrl: decodedRelays[0] || 'wss://relay.damus.io'
     };
 
-    setBids(prev => [simulatedBid, ...prev]);
+    setBids(prev => [...prev, simulatedBid].sort(compareBidsDeterministic));
   };
 
   // Generate shareable URL
@@ -540,7 +588,7 @@ export default function App() {
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
           <a href="#auction-hero" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Auction Details</a>
           <a href="#highest-bidder" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Highest Bid</a>
-          <a href="#live-feed" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Relay Feed</a>
+          <a href="#live-feed" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Bids</a>
           <a href="#relays" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Relays</a>
         </nav>
 
@@ -606,8 +654,6 @@ export default function App() {
               <div className="flex items-center justify-between gap-4 mb-4">
                 <div className="flex items-center gap-2 text-xs font-medium text-slate-400 font-mono">
                   <span>AUCTION EVENT (NEVENT)</span>
-                  <span>·</span>
-                  <span className="text-amber-400">RELAY STREAM ACTIVE</span>
                 </div>
                 <div className={`px-2.5 py-1 rounded-full text-xs font-semibold font-mono flex items-center gap-1.5 ${
                   auctionClosed ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
@@ -766,7 +812,7 @@ export default function App() {
               <h2 className="text-lg font-bold text-white tracking-tight">Current Highest Bidder</h2>
             </div>
             <span className="text-xs font-mono text-amber-400 bg-amber-500/10 px-3 py-1 rounded-full border border-amber-500/20">
-              REAL-TIME RELAY LEADER
+              HIGHEST VALID BID
             </span>
           </div>
 
@@ -820,40 +866,32 @@ export default function App() {
           )}
         </section>
 
-        {/* Live Bid Stream & Relay Status Grid */}
+        {/* Bid Leaderboard & Relay Status Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
           
-          {/* Left 2 Cols: Live Bid Stream */}
+          {/* Left 2 Cols: Bids Ranked by Amount */}
           <section id="live-feed" className="lg:col-span-2 rounded-2xl bg-slate-900/80 border border-slate-800/80 p-6 md:p-8 shadow-xl">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-amber-400">
                   <Radio className="w-4 h-4 animate-pulse" />
                 </div>
-                <h2 className="text-lg font-bold text-white tracking-tight">Live Relay Bid Feed</h2>
+                <h2 className="text-lg font-bold text-white tracking-tight">Relay Bids (Sorted by Amount)</h2>
               </div>
               <span className="text-xs font-mono text-slate-400 bg-slate-800 px-3 py-1 rounded-full">
-                {bids.length} Total Replies
+                {sortedBids.length} Total Bids
               </span>
             </div>
 
-            {bids.length > 0 ? (
+            {sortedBids.length > 0 ? (
               <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
-                {[...bids].sort((a, b) => {
-                  const aExpired = closingBlockTimestamp !== null && a.createdAt > closingBlockTimestamp;
-                  const bExpired = closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp;
-                  const aValid = a.amountSats >= startingBidNum && !aExpired;
-                  const bValid = b.amountSats >= startingBidNum && !bExpired;
-                  if (aValid && !bValid) return -1;
-                  if (!aValid && bValid) return 1;
-                  return b.amountSats - a.amountSats;
-                }).map((bid, index) => {
+                {sortedBids.map((bid) => {
                   const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
                   const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
                   const isHighest = highestBid && highestBid.id === bid.id;
                   return (
                     <div 
-                      key={bid.id + index}
+                      key={bid.id}
                       className={`p-4 rounded-xl border transition-all ${
                         isHighest 
                           ? 'bg-amber-500/10 border-amber-500/40 shadow-lg shadow-amber-500/5' 
@@ -909,7 +947,7 @@ export default function App() {
           <section id="relays" className="rounded-2xl bg-slate-900/80 border border-slate-800/80 p-6 shadow-xl">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-sm font-bold text-white tracking-tight uppercase font-mono">Connected Relays</h2>
-              <span className="text-xs font-mono text-slate-400">{relaysStatus.filter(r => r.connected).length}/{relaysStatus.length} Online</span>
+              <span className="text-xs font-mono text-slate-400">{connectedRelays.length}/{relaysStatus.length} Online</span>
             </div>
 
             <div className="space-y-3 mb-6">
@@ -919,8 +957,8 @@ export default function App() {
                     <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${relay.connected ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}></span>
                     <span className="text-xs font-mono text-slate-300 truncate">{relay.url.replace('wss://', '')}</span>
                   </div>
-                  <span className="text-[11px] font-mono text-slate-400 shrink-0 ml-2">
-                    {relay.messageCount} msgs
+                  <span className={`text-[11px] font-mono shrink-0 ml-2 ${relay.connected ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {relay.connected ? 'Online' : 'Offline'}
                   </span>
                 </div>
               ))}
