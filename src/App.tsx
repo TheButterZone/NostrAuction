@@ -5,9 +5,9 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
-  Zap, Radio, Shield, Terminal, Clock, Award, 
+  Zap, Radio, Terminal, Clock, Award, 
   ExternalLink, Copy, Check, RefreshCw, AlertCircle, 
-  TrendingUp, Users, ArrowUpRight, Play, Settings2, Sparkles, CheckCircle2
+  Settings2, CheckCircle2
 } from 'lucide-react';
 import { nip19 } from 'nostr-tools';
 
@@ -28,6 +28,7 @@ interface RelayStatus {
 }
 
 const DEFAULT_TEST_NEVENT = "nevent1qgspnzhy9x60m7m66rg9c6rhcwev0k66ahllj72xst799l2sar8wy7sqyz00g9htar9cly8nu9pag5ydrnjtvf0lra7qar4ts4jauyyuh0cavmdttpz";
+const LATEST_THREAD_NEVENT = "nevent1qgsflquxnjhuleknfccdgczyhjqa6fqgtzef58mt7yhyfm7gcm2nwesqyqqqpllv9krk349gadc6j4vy6nu0zqu29zcs76u9get3x97t0jevjpr855h";
 const DEFAULT_STARTING_BID = 250000;
 const DEFAULT_TARGET_BLOCK = 977136;
 const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
@@ -35,8 +36,11 @@ const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
   "wss://relay.primal.net",
+  "wss://relay.damus.io",
   "wss://relay.snort.social",
   "wss://bitcoiner.social",
+  "wss://relay.wellorder.net",
+  "wss://relay.nostrfy.org",
   "wss://relay.ditto.pub",
   "wss://relay.dreamith.to",
 ];
@@ -50,7 +54,29 @@ function extractEventRefTags(ev: any): string[] {
       }
     }
   }
-  return refs;
+  return Array.from(new Set(refs));
+}
+
+function decodeNeventDetails(input: string): { id: string; relays: string[]; author: string } {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('nevent1')) {
+    const decoded = nip19.decode(trimmed);
+    if (decoded.type === 'nevent') {
+      return {
+        id: decoded.data.id,
+        relays: decoded.data.relays || [],
+        author: decoded.data.author || '',
+      };
+    }
+  } else if (trimmed.startsWith('note1')) {
+    const decoded = nip19.decode(trimmed);
+    if (decoded.type === 'note') {
+      return { id: decoded.data, relays: [], author: '' };
+    }
+  } else if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    return { id: trimmed.toLowerCase(), relays: [], author: '' };
+  }
+  return { id: '', relays: [], author: '' };
 }
 
 export default function App() {
@@ -74,11 +100,12 @@ export default function App() {
 
   // Decoded event details
   const [decodedEventId, setDecodedEventId] = useState<string>('');
-  const [decodedRelays, setDecodedRelays] = useState<string[]>([]);
+  const [decodedRelays, setDecodedRelays] = useState<string[]>(DEFAULT_RELAYS);
   const [authorPubkey, setAuthorPubkey] = useState<string>('');
 
-  // Live Bitcoin Block Height
+  // Live Bitcoin Block Height & Closing Block Timestamp
   const [currentBlockHeight, setCurrentBlockHeight] = useState<number | null>(null);
+  const [closingBlockTimestamp, setClosingBlockTimestamp] = useState<number | null>(null);
   const [isLiveBlockFetching, setIsLiveBlockFetching] = useState<boolean>(true);
   const [blockFetchError, setBlockFetchError] = useState<string | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
@@ -94,56 +121,42 @@ export default function App() {
   // WebSocket references
   const wsRefs = useRef<{ [url: string]: WebSocket }>({});
 
-  // Parse nevent using nostr-tools
+  // Parse nevent + anchor thread relay hints using nostr-tools
   useEffect(() => {
     try {
-      let eventId = '';
-      let relays: string[] = [...DEFAULT_RELAYS];
-      let pubkey = '';
+      const primary = decodeNeventDetails(neventInput);
+      const secondary = decodeNeventDetails(LATEST_THREAD_NEVENT);
 
-      const trimmed = neventInput.trim();
-      if (trimmed.startsWith('nevent1')) {
-        const decoded = nip19.decode(trimmed);
-        if (decoded.type === 'nevent') {
-          eventId = decoded.data.id;
-          if (decoded.data.relays && decoded.data.relays.length > 0) {
-            relays = Array.from(new Set([...decoded.data.relays, ...DEFAULT_RELAYS]));
-          }
-          if (decoded.data.author) {
-            pubkey = decoded.data.author;
-          }
-        }
-      } else if (trimmed.startsWith('note1')) {
-        const decoded = nip19.decode(trimmed);
-        if (decoded.type === 'note') {
-          eventId = decoded.data;
-        }
-      } else if (trimmed.length === 64) {
-        eventId = trimmed;
-      } else {
-        // Fallback default test ID
-        eventId = "7f70b7952e379bc5943b7e7a7a58a74b1e4c32b535d4f3b7d8b53d4f3b7d8b53";
-      }
+      const eventId = primary.id || "7f70b7952e379bc5943b7e7a7a58a74b1e4c32b535d4f3b7d8b53d4f3b7d8b53";
+      const normalizedRelays = Array.from(
+        new Set(
+          [...primary.relays, ...secondary.relays, ...DEFAULT_RELAYS]
+            .map(u => u.trim().replace(/\/+$/, ''))
+            .filter(u => u.startsWith('wss://') || u.startsWith('ws://'))
+        )
+      );
 
       setDecodedEventId(eventId);
-      setDecodedRelays(relays);
-      setAuthorPubkey(pubkey);
+      setDecodedRelays(normalizedRelays);
+      setAuthorPubkey(primary.author || secondary.author || '');
 
-      setRelaysStatus(relays.map(url => ({
+      setRelaysStatus(normalizedRelays.map(url => ({
         url,
         connected: false,
         messageCount: 0
       })));
     } catch (err) {
       console.error("Failed to decode nevent:", err);
-      // Fallback
       setDecodedEventId(neventInput);
       setDecodedRelays(DEFAULT_RELAYS);
       setRelaysStatus(DEFAULT_RELAYS.map(url => ({ url, connected: false, messageCount: 0 })));
     }
   }, [neventInput]);
 
-  // Fetch live bitcoin block height from mempool.space API
+  const targetBlockNum = parseInt(targetBlockInput, 10) || DEFAULT_TARGET_BLOCK;
+  const startingBidNum = parseInt(startingBidInput, 10) || DEFAULT_STARTING_BID;
+
+  // Fetch live bitcoin block height & target block timestamp from mempool.space API
   const fetchBlockHeight = useCallback(async () => {
     setIsLiveBlockFetching(true);
     try {
@@ -155,6 +168,26 @@ export default function App() {
         setCurrentBlockHeight(height);
         setLastSyncedAt(Math.floor(Date.now() / 1000));
         setBlockFetchError(null);
+
+        if (height >= targetBlockNum) {
+          try {
+            const hashRes = await fetch(`https://mempool.space/api/block-height/${targetBlockNum}`, { cache: 'no-store' });
+            if (hashRes.ok) {
+              const blockHash = (await hashRes.text()).trim();
+              const blockRes = await fetch(`https://mempool.space/api/block/${blockHash}`, { cache: 'no-store' });
+              if (blockRes.ok) {
+                const blockData = await blockRes.json();
+                if (typeof blockData.timestamp === 'number') {
+                  setClosingBlockTimestamp(blockData.timestamp);
+                }
+              }
+            }
+          } catch (tsErr) {
+            console.warn("Failed to fetch closing block timestamp:", tsErr);
+          }
+        } else {
+          setClosingBlockTimestamp(null);
+        }
       }
     } catch (err) {
       console.warn("Mempool API fetch error:", err);
@@ -162,7 +195,7 @@ export default function App() {
     } finally {
       setIsLiveBlockFetching(false);
     }
-  }, []);
+  }, [targetBlockNum]);
 
   useEffect(() => {
     fetchBlockHeight();
@@ -170,14 +203,23 @@ export default function App() {
     return () => clearInterval(interval);
   }, [fetchBlockHeight]);
 
-  const targetBlockNum = parseInt(targetBlockInput, 10) || DEFAULT_TARGET_BLOCK;
-  const startingBidNum = parseInt(startingBidInput, 10) || DEFAULT_STARTING_BID;
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
-  // Highest bid calculation
-  const validBids = bids.filter(b => b.amountSats >= startingBidNum);
+  // Highest bid calculation (enforcing closing block timestamp cutoff when mined)
+  const validBids = bids.filter(b => {
+    if (b.amountSats < startingBidNum) return false;
+    if (closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp) return false;
+    return true;
+  });
+
   const highestBid = validBids.length > 0 
-    ? validBids.reduce((max, b) => b.amountSats > max.amountSats ? b : max, validBids[0])
+    ? validBids.reduce((max, b) => {
+        if (b.amountSats !== max.amountSats) {
+          return b.amountSats > max.amountSats ? b : max;
+        }
+        // Earlier timestamp wins ties
+        return b.createdAt < max.createdAt ? b : max;
+      }, validBids[0])
     : null;
 
   // Check if auction closed and trigger winner notification
@@ -187,53 +229,51 @@ export default function App() {
     }
   }, [auctionClosed, highestBid, winnerNotified]);
 
-  // Connect to Relays WebSocket with dual root anchoring, bidirectional e/E-tag walking, and orphan queueing
+  // Connect to Relays WebSocket with dual root anchoring, active parent fetching, and bidirectional e/E-tag walking
   useEffect(() => {
-    if (!decodedEventId) return;
+    if (!decodedEventId || decodedRelays.length === 0) return;
 
     setIsListening(true);
-    setBids([]); // Clean state for live relay stream
+    setBids([]);
     const newWsRefs: { [url: string]: WebSocket } = {};
 
-    const LATEST_THREAD_NEVENT = "nevent1qgsflquxnjhuleknfccdgczyhjqa6fqgtzef58mt7yhyfm7gcm2nwesqyqqqpllv9krk349gadc6j4vy6nu0zqu29zcs76u9get3x97t0jevjpr855h";
-    let latestPostEventId = '';
-    try {
-      const decodedLatest = nip19.decode(LATEST_THREAD_NEVENT);
-      if (decodedLatest.type === 'nevent') {
-        latestPostEventId = decodedLatest.data.id;
-      }
-    } catch (e) {
-      console.warn("Failed to decode latest thread nevent", e);
-    }
+    const secondaryDecoded = decodeNeventDetails(LATEST_THREAD_NEVENT);
+    const rootEventIds = Array.from(
+      new Set([decodedEventId, secondaryDecoded.id].filter(Boolean))
+    );
 
-    // Dual Root Anchoring: Start nevent + Latest thread nevent
-    const rootEventIds = latestPostEventId ? [decodedEventId, latestPostEventId] : [decodedEventId];
     const discoveredEventIds = new Set<string>(rootEventIds);
+    const queriedIds = new Set<string>(rootEventIds);
     const seenBidIds = new Set<string>();
     const pendingByParentId = new Map<string, Array<{ ev: any; relayUrl: string }>>();
 
-    const acceptThreadEvent = (ws: WebSocket, ev: any, eventRefTags: string[], relayUrl: string) => {
+    const queryTargetAcrossSockets = (targetId: string) => {
+      if (!targetId || queriedIds.has(targetId)) return;
+      queriedIds.add(targetId);
+
+      Object.values(newWsRefs).forEach(sock => {
+        if (sock.readyState === WebSocket.OPEN) {
+          const suffix = `${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
+          sock.send(JSON.stringify(["REQ", `auction_bidir_e_${suffix}`, { kinds: [1, 1111], '#e': [targetId], limit: 200 }]));
+          sock.send(JSON.stringify(["REQ", `auction_bidir_E_${suffix}`, { kinds: [1, 1111], '#E': [targetId], limit: 200 }]));
+          sock.send(JSON.stringify(["REQ", `auction_id_${suffix}`, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
+        }
+      });
+    };
+
+    const acceptThreadEvent = (ev: any, eventRefTags: string[], relayUrl: string) => {
       parseAndAddBid(ev, relayUrl, seenBidIds);
 
       const newlyDiscovered = !discoveredEventIds.has(ev.id);
       discoveredEventIds.add(ev.id);
 
-      // Register event ID and its e/E-tag parents/children for bidirectional walking
-      const idsToQuery = [ev.id, ...eventRefTags];
-      idsToQuery.forEach(targetId => {
+      // Walk both the event's own ID (for child replies) and all its e/E references (for parent/root events)
+      const idsToWalk = [ev.id, ...eventRefTags];
+      idsToWalk.forEach(targetId => {
         if (!discoveredEventIds.has(targetId)) {
           discoveredEventIds.add(targetId);
-          if (ws.readyState === WebSocket.OPEN) {
-            const bidirLowerId = `auction_bidir_e_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", bidirLowerId, { kinds: [1, 1111], '#e': [targetId], limit: 150 }]));
-
-            const bidirUpperId = `auction_bidir_E_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", bidirUpperId, { kinds: [1, 1111], '#E': [targetId], limit: 150 }]));
-
-            const directIdSubId = `auction_id_${targetId.substring(0, 8)}_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", directIdSubId, { kinds: [1, 1111], ids: [targetId], limit: 50 }]));
-          }
         }
+        queryTargetAcrossSockets(targetId);
       });
 
       // Flush any out-of-order children waiting on this event ID
@@ -241,7 +281,7 @@ export default function App() {
         const queued = pendingByParentId.get(ev.id) || [];
         pendingByParentId.delete(ev.id);
         for (const item of queued) {
-          acceptThreadEvent(ws, item.ev, extractEventRefTags(item.ev), item.relayUrl);
+          acceptThreadEvent(item.ev, extractEventRefTags(item.ev), item.relayUrl);
         }
       }
     };
@@ -253,21 +293,23 @@ export default function App() {
 
         ws.onopen = () => {
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, error: undefined } : r));
-          
-          // 1. Dual Root Subscriptions (#e, #E, and ids filters across kinds 1 and 1111)
-          const subRootLowerId = `auction_dual_roots_e_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootLowerId, { kinds: [1, 1111], '#e': rootEventIds, limit: 300 }]));
 
-          const subRootUpperId = `auction_dual_roots_E_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootUpperId, { kinds: [1, 1111], '#E': rootEventIds, limit: 300 }]));
+          const allKnownIds = Array.from(discoveredEventIds);
 
-          const subRootIdsId = `auction_dual_roots_ids_${Math.random().toString(36).substring(7)}`;
-          ws.send(JSON.stringify(["REQ", subRootIdsId, { kinds: [1, 1111], ids: rootEventIds, limit: 100 }]));
+          // 1. Subscribe to #e, #E, and direct ids for all known root/discovered thread events
+          const subRootLowerId = `auction_roots_e_${Math.random().toString(36).substring(7)}`;
+          ws.send(JSON.stringify(["REQ", subRootLowerId, { kinds: [1, 1111], '#e': allKnownIds, limit: 500 }]));
+
+          const subRootUpperId = `auction_roots_E_${Math.random().toString(36).substring(7)}`;
+          ws.send(JSON.stringify(["REQ", subRootUpperId, { kinds: [1, 1111], '#E': allKnownIds, limit: 500 }]));
+
+          const subRootIdsId = `auction_roots_ids_${Math.random().toString(36).substring(7)}`;
+          ws.send(JSON.stringify(["REQ", subRootIdsId, { kinds: [1, 1111], ids: allKnownIds, limit: 200 }]));
 
           // 2. Author notes query if authorPubkey is known
           if (authorPubkey) {
             const subAuthorId = `auction_author_${Math.random().toString(36).substring(7)}`;
-            ws.send(JSON.stringify(["REQ", subAuthorId, { kinds: [1, 1111], authors: [authorPubkey], limit: 100 }]));
+            ws.send(JSON.stringify(["REQ", subAuthorId, { kinds: [1, 1111], authors: [authorPubkey], limit: 200 }]));
           }
         };
 
@@ -278,27 +320,22 @@ export default function App() {
               const ev = data[2];
               const eventRefTags = extractEventRefTags(ev);
 
-              // Check if event belongs to thread graph (tags root event, any discovered event, or is a root id)
-              let belongsToThread = rootEventIds.includes(ev.id) || rootEventIds.some(id => eventRefTags.includes(id));
-              if (!belongsToThread) {
-                for (const refTag of eventRefTags) {
-                  if (discoveredEventIds.has(refTag)) {
-                    belongsToThread = true;
-                    break;
-                  }
-                }
-              }
+              // Check if event belongs to thread graph (is a root/discovered ID or tags any root/discovered ID)
+              let belongsToThread =
+                discoveredEventIds.has(ev.id) ||
+                eventRefTags.some(refTag => discoveredEventIds.has(refTag));
 
               if (belongsToThread) {
-                acceptThreadEvent(ws, ev, eventRefTags, relayUrl);
+                acceptThreadEvent(ev, eventRefTags, relayUrl);
               } else if (eventRefTags.length > 0 && !seenBidIds.has(ev.id)) {
-                // Queue until one of its referenced parent/thread events is discovered
+                // Queue until one of its referenced parent/thread events arrives, and actively query those parent IDs
                 for (const refTag of eventRefTags) {
                   const list = pendingByParentId.get(refTag) || [];
                   if (!list.some(item => item.ev.id === ev.id)) {
                     list.push({ ev, relayUrl });
                     pendingByParentId.set(refTag, list);
                   }
+                  queryTargetAcrossSockets(refTag);
                 }
               }
 
@@ -331,7 +368,7 @@ export default function App() {
         }
       });
     };
-  }, [decodedEventId]);
+  }, [decodedEventId, decodedRelays, authorPubkey]);
 
   // Parse Nostr event content to extract bid amounts in satoshis across nested threads
   const parseAndAddBid = (ev: any, relayUrl: string, seenSet?: Set<string>) => {
@@ -353,7 +390,6 @@ export default function App() {
       };
 
       setBids(prev => {
-        // Prevent duplicates
         if (prev.some(b => b.id === newBid.id)) return prev;
         return [newBid, ...prev];
       });
@@ -363,7 +399,7 @@ export default function App() {
   const extractSatsFromText = (text: string): number | null => {
     const cleanText = text.toLowerCase().replace(/,/g, '');
     
-    // Match shorthand like "500k", "1.5m", "425k"
+    // Match shorthand like "500k", "1.5m", "425k", "650k", "660k"
     const kMatch = cleanText.match(/(\d*\.?\d+)\s*k\b/);
     if (kMatch) {
       const num = parseFloat(kMatch[1]);
@@ -388,11 +424,11 @@ export default function App() {
       return Math.round(btc * 100000000);
     }
 
-    // Match short auction bid shorthands like "430", "450", "425" as thousands if between 300 and 999
-    const shortNumMatch = cleanText.match(/\b([3-9]\d{2})\b/);
+    // Match short auction bid shorthands like "430", "450", "680" as thousands if between 250 and 999
+    const shortNumMatch = cleanText.match(/\b([2-9]\d{2})\b/);
     if (shortNumMatch) {
       const val = parseInt(shortNumMatch[1], 10);
-      if (val >= 300 && val <= 999) return val * 1000;
+      if (val >= 250 && val <= 999) return val * 1000;
     }
 
     // Match single digit like "5" or "5.0" meaning 500k in context of 450k -> 500k
@@ -400,7 +436,7 @@ export default function App() {
       return 500000;
     }
 
-    // Fallback: check if there is a standalone large number >= starting bid
+    // Fallback: check if there is a standalone large number >= 10000
     const numbers = cleanText.match(/\b\d{5,10}\b/g);
     if (numbers && numbers.length > 0) {
       const val = parseInt(numbers[0], 10);
@@ -580,7 +616,7 @@ export default function App() {
                 </div>
 
                 <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/60 col-span-2 sm:col-span-1">
-                  <span className="text-xs text-slate-400 font-mono block mb-1">Total Bids</span>
+                  <span className="text-xs text-slate-400 font-mono block mb-1">Total Valid Bids</span>
                   <span className="text-lg font-bold text-white font-mono tabular-nums">
                     {validBids.length}
                   </span>
@@ -676,6 +712,14 @@ export default function App() {
                     {lastSyncedAt ? new Date(lastSyncedAt * 1000).toLocaleTimeString() : 'Never'}
                   </span>
                 </div>
+                {closingBlockTimestamp !== null && (
+                  <div className="flex justify-between">
+                    <span>Cutoff UTC</span>
+                    <span className="text-slate-200 tabular-nums">
+                      {new Date(closingBlockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 19)}Z
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -770,13 +814,16 @@ export default function App() {
             {bids.length > 0 ? (
               <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
                 {[...bids].sort((a, b) => {
-                  const aValid = a.amountSats >= startingBidNum;
-                  const bValid = b.amountSats >= startingBidNum;
+                  const aExpired = closingBlockTimestamp !== null && a.createdAt > closingBlockTimestamp;
+                  const bExpired = closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp;
+                  const aValid = a.amountSats >= startingBidNum && !aExpired;
+                  const bValid = b.amountSats >= startingBidNum && !bExpired;
                   if (aValid && !bValid) return -1;
                   if (!aValid && bValid) return 1;
-                  return b.amountSats - a.amountSats; // Highest bid at top, lowest at bottom
+                  return b.amountSats - a.amountSats;
                 }).map((bid, index) => {
-                  const isValid = bid.amountSats >= startingBidNum;
+                  const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
+                  const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
                   const isHighest = highestBid && highestBid.id === bid.id;
                   return (
                     <div 
@@ -799,6 +846,11 @@ export default function App() {
                           {isHighest && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
                               Highest
+                            </span>
+                          )}
+                          {isAfterCutoff && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 uppercase tracking-wider">
+                              Post-Block
                             </span>
                           )}
                           <span className={`font-mono text-sm font-bold tabular-nums ${isValid ? 'text-white' : 'text-slate-400'}`}>
@@ -868,7 +920,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-900/40 py-6 px-6 text-center text-xs text-slate-400 font-mono">
-        <p>NostrAuction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
+        <p>SatsNsite Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
       </footer>
 
       {/* Configuration & Tester Modal */}
