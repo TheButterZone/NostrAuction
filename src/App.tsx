@@ -36,11 +36,8 @@ const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
   "wss://relay.primal.net",
-  "wss://relay.damus.io",
   "wss://relay.snort.social",
   "wss://bitcoiner.social",
-  "wss://relay.wellorder.net",
-  "wss://relay.nostrfy.org",
   "wss://relay.ditto.pub",
   "wss://relay.dreamith.to",
 ];
@@ -920,7 +917,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-900/40 py-6 px-6 text-center text-xs text-slate-400 font-mono">
-        <p>SatsNsite Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
+        <p>NostrAuction Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
       </footer>
 
       {/* Configuration & Tester Modal */}
