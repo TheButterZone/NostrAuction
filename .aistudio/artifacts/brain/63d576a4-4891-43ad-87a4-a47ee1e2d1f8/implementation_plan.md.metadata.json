@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for sorting the live relay bid feed by highest bid amount descending (highest at top, lowest at bottom) with invalid bids displayed below with muted status.",
-  "updatedAt":  "2026-11-22T17:52:21.760330216Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
