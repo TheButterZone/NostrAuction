@@ -575,11 +575,77 @@ export default function App() {
       {/* Top Bar Contract (1 row, 3 zones, gap-8) */}
       <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-slate-900/55 backdrop-blur-md sticky top-0 z-50">
         
-        {/* Zone 1: Single text element wordmark */}
+{/* Zone 1: Single text element wordmark */}
         <div className="flex items-center gap-3 shrink-0">
-          <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 font-bold">
-            ⚡
-          </div>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 64 64"
+  width="64"
+  height="64"
+  className="w-8 h-8 rounded-[14px] shrink-0"
+  aria-label="NostrAuction ostrich gavel icon"
+>
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="#EED9B5" />
+  <ellipse cx="36.5" cy="29" rx="13" ry="10.5" fill="#1E2022" />
+  <g transform="translate(13.5,18) rotate(-42)">
+    <rect x="-1.1" y="1.8" width="2.2" height="14.5" rx="0.8" fill="#6D4C41" stroke="#3E2723" strokeWidth="0.7" />
+    <rect x="-4.5" y="-1.8" width="9" height="3.6" rx="0.8" fill="#5D4037" stroke="#3E2723" strokeWidth="0.7" />
+    <rect x="-5.5" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+    <rect x="3.9" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+  </g>
+  <path
+    d="M30 23 C25 22.5 19.5 23.5 18 26.5 C17 29 21 31.5 27.5 31.5 C31.5 31.5 33 26.5 30 23 Z"
+    fill="#F5EFE0"
+    stroke="#454A52"
+    strokeWidth="1.1"
+    strokeLinejoin="round"
+  />
+  <path
+    d="M20.5 26.2 Q24.5 25.8 27.5 27.2"
+    fill="none"
+    stroke="#454A52"
+    strokeWidth="1"
+    strokeLinecap="round"
+  />
+  <path
+    d="M33.5 25.5 C31.5 24 30.5 26.5 32.5 28 C31 29 32.5 31.5 34.5 30.5 C35.5 32.5 38 32.5 39 30.5 C41 31.5 42.5 29 41 28 C43 26.5 42 24 40 25.5 Z"
+    fill="#F5EFE0"
+    stroke="#1E2022"
+    strokeWidth="1"
+    strokeLinejoin="round"
+  />
+  <path
+    d="M35 27 C36 22 40.5 19 37 14 C34.5 10.5 33.5 9 33.5 7 L37 7 C37 9 38 10.5 40.5 14 C44 19 39.5 22 38.5 27 Z"
+    fill="#F5EFE0"
+    stroke="#1E2022"
+    strokeWidth="1.1"
+    strokeLinejoin="round"
+  />
+  <path
+    d="M39 5.8 Q45 5.8 46 7.4 Q45 9 39 8.8 Z"
+    fill="#C9A9A6"
+    stroke="#1E2022"
+    strokeWidth="1"
+    strokeLinejoin="round"
+  />
+  <path d="M39.5 7.4 L45.5 7.4" stroke="#1E2022" strokeWidth="0.8" strokeLinecap="round" />
+  <path
+    d="M31.5 8.5 Q29.5 7.5 31 6 Q30 4.2 32 4.5 Q32 2.5 34 3.5 Q35 1.8 36.5 3.5 Q39 3.5 39.5 6.5 Q39.5 9.5 36 9.8 Q32.5 9.8 31.5 8.5 Z"
+    fill="#F5EFE0"
+    stroke="#1E2022"
+    strokeWidth="1.1"
+    strokeLinejoin="round"
+  />
+  <circle cx="36.3" cy="6.2" r="1.5" fill="#1E2022" />
+  <circle cx="36.7" cy="5.8" r="0.5" fill="#FFFFFF" />
+  <path
+    d="M7 36 L57 36 L53.5 59.5 Q53 60.5 52 60.5 L12 60.5 Q11 60.5 10.5 59.5 Z"
+    fill="#655A4E"
+    stroke="#807153"
+    strokeWidth="1.1"
+  />
+  <rect x="5" y="33.5" width="54" height="4.8" rx="1.8" fill="#655A4E" stroke="#807153" strokeWidth="1.1" />
+</svg>
           <span className="text-lg font-bold tracking-tight text-white whitespace-nowrap">
             NostrAuction <span className="text-amber-400 font-mono text-xs ml-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
           </span>
