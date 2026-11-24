@@ -103,6 +103,8 @@ export default function App() {
     return params.get('anchor') || '';
   });
 
+  const [showAnchorField, setShowAnchorField] = useState<boolean>(() => Boolean(anchorInput.trim()));
+
   const [startingBidInput, setStartingBidInput] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
     const start = params.get('start') || params.get('starting_bid') || params.get('bid');
@@ -780,88 +782,101 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
+    <div className="min-h-screen overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
       
-      {/* Top Bar Contract (1 row, 3 zones, gap-8) */}
-      <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-slate-900/55 backdrop-blur-md sticky top-0 z-50">
+      {/* Top Bar Contract (stacked on mobile, single row on desktop) */}
+      <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-8 px-4 sm:px-6 py-4 border-b border-slate-800/80 bg-slate-900/55 backdrop-blur-md sticky top-0 z-50">
         
-        {/* Zone 1: Single text element wordmark */}
-        <div className="flex items-center gap-3 shrink-0">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 64 64"
-            width="64"
-            height="64"
-            className="w-8 h-8 rounded-[14px] shrink-0"
-            aria-label="NostrAuction ostrich gavel icon"
+        {/* Left group: Logo/wordmark + mobile Configure Auction button directly underneath */}
+        <div className="flex flex-col items-start gap-2.5 min-w-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 64 64"
+              width="64"
+              height="64"
+              className="w-8 h-8 rounded-[14px] shrink-0"
+              aria-label="NostrAuction ostrich gavel icon"
+            >
+              <rect x="0" y="0" width="64" height="64" rx="14" fill="#EED9B5" />
+              <ellipse cx="36.5" cy="29" rx="13" ry="10.5" fill="#1E2022" />
+              <g transform="translate(13.5,18) rotate(-42)">
+                <rect x="-1.1" y="1.8" width="2.2" height="14.5" rx="0.8" fill="#6D4C41" stroke="#3E2723" strokeWidth="0.7" />
+                <rect x="-4.5" y="-1.8" width="9" height="3.6" rx="0.8" fill="#5D4037" stroke="#3E2723" strokeWidth="0.7" />
+                <rect x="-5.5" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+                <rect x="3.9" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
+              </g>
+              <path
+                d="M30 23 C25 22.5 19.5 23.5 18 26.5 C17 29 21 31.5 27.5 31.5 C31.5 31.5 33 26.5 30 23 Z"
+                fill="#F5EFE0"
+                stroke="#454A52"
+                strokeWidth="1.1"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M20.5 26.2 Q24.5 25.8 27.5 27.2"
+                fill="none"
+                stroke="#454A52"
+                strokeWidth="1"
+                strokeLinecap="round"
+              />
+              <path
+                d="M33.5 25.5 C31.5 24 30.5 26.5 32.5 28 C31 29 32.5 31.5 34.5 30.5 C35.5 32.5 38 32.5 39 30.5 C41 31.5 42.5 29 41 28 C43 26.5 42 24 40 25.5 Z"
+                fill="#F5EFE0"
+                stroke="#1E2022"
+                strokeWidth="1"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M35 27 C36 22 40.5 19 37 14 C34.5 10.5 33.5 9 33.5 7 L37 7 C37 9 38 10.5 40.5 14 C44 19 39.5 22 38.5 27 Z"
+                fill="#F5EFE0"
+                stroke="#1E2022"
+                strokeWidth="1.1"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M39 5.8 Q45 5.8 46 7.4 Q45 9 39 8.8 Z"
+                fill="#C9A9A6"
+                stroke="#1E2022"
+                strokeWidth="1"
+                strokeLinejoin="round"
+              />
+              <path d="M39.5 7.4 L45.5 7.4" stroke="#1E2022" strokeWidth="0.8" strokeLinecap="round" />
+              <path
+                d="M31.5 8.5 Q29.5 7.5 31 6 Q30 4.2 32 4.5 Q32 2.5 34 3.5 Q35 1.8 36.5 3.5 Q39 3.5 39.5 6.5 Q39.5 9.5 36 9.8 Q32.5 9.8 31.5 8.5 Z"
+                fill="#F5EFE0"
+                stroke="#1E2022"
+                strokeWidth="1.1"
+                strokeLinejoin="round"
+              />
+              <circle cx="36.3" cy="6.2" r="1.5" fill="#1E2022" />
+              <circle cx="36.7" cy="5.8" r="0.5" fill="#FFFFFF" />
+              <path
+                d="M7 36 L57 36 L53.5 59.5 Q53 60.5 52 60.5 L12 60.5 Q11 60.5 10.5 59.5 Z"
+                fill="#655A4E"
+                stroke="#807153"
+                strokeWidth="1.1"
+              />
+              <rect x="5" y="33.5" width="54" height="4.8" rx="1.8" fill="#655A4E" stroke="#807153" strokeWidth="1.1" />
+            </svg>
+            <span className="text-base sm:text-lg font-bold tracking-tight text-white">
+              NostrAuction <span className="text-amber-400 font-mono text-[11px] sm:text-xs ml-1 px-1.5 sm:px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
+            </span>
+          </div>
+
+          {/* Mobile/tablet button directly below logo/title, left-aligned */}
+          <button
+            type="button"
+            onClick={() => setShowTesterModal(true)}
+            disabled={auctionFinalized && wasLiveBeforeClose}
+            className="flex md:hidden items-center gap-2 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg shadow-amber-400/10 cursor-pointer"
           >
-            <rect x="0" y="0" width="64" height="64" rx="14" fill="#EED9B5" />
-            <ellipse cx="36.5" cy="29" rx="13" ry="10.5" fill="#1E2022" />
-            <g transform="translate(13.5,18) rotate(-42)">
-              <rect x="-1.1" y="1.8" width="2.2" height="14.5" rx="0.8" fill="#6D4C41" stroke="#3E2723" strokeWidth="0.7" />
-              <rect x="-4.5" y="-1.8" width="9" height="3.6" rx="0.8" fill="#5D4037" stroke="#3E2723" strokeWidth="0.7" />
-              <rect x="-5.5" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
-              <rect x="3.9" y="-2.2" width="1.6" height="4.4" rx="0.5" fill="#4E342E" stroke="#3E2723" strokeWidth="0.7" />
-            </g>
-            <path
-              d="M30 23 C25 22.5 19.5 23.5 18 26.5 C17 29 21 31.5 27.5 31.5 C31.5 31.5 33 26.5 30 23 Z"
-              fill="#F5EFE0"
-              stroke="#454A52"
-              strokeWidth="1.1"
-              strokeLinejoin="round"
-            />
-            <path
-              d="M20.5 26.2 Q24.5 25.8 27.5 27.2"
-              fill="none"
-              stroke="#454A52"
-              strokeWidth="1"
-              strokeLinecap="round"
-            />
-            <path
-              d="M33.5 25.5 C31.5 24 30.5 26.5 32.5 28 C31 29 32.5 31.5 34.5 30.5 C35.5 32.5 38 32.5 39 30.5 C41 31.5 42.5 29 41 28 C43 26.5 42 24 40 25.5 Z"
-              fill="#F5EFE0"
-              stroke="#1E2022"
-              strokeWidth="1"
-              strokeLinejoin="round"
-            />
-            <path
-              d="M35 27 C36 22 40.5 19 37 14 C34.5 10.5 33.5 9 33.5 7 L37 7 C37 9 38 10.5 40.5 14 C44 19 39.5 22 38.5 27 Z"
-              fill="#F5EFE0"
-              stroke="#1E2022"
-              strokeWidth="1.1"
-              strokeLinejoin="round"
-            />
-            <path
-              d="M39 5.8 Q45 5.8 46 7.4 Q45 9 39 8.8 Z"
-              fill="#C9A9A6"
-              stroke="#1E2022"
-              strokeWidth="1"
-              strokeLinejoin="round"
-            />
-            <path d="M39.5 7.4 L45.5 7.4" stroke="#1E2022" strokeWidth="0.8" strokeLinecap="round" />
-            <path
-              d="M31.5 8.5 Q29.5 7.5 31 6 Q30 4.2 32 4.5 Q32 2.5 34 3.5 Q35 1.8 36.5 3.5 Q39 3.5 39.5 6.5 Q39.5 9.5 36 9.8 Q32.5 9.8 31.5 8.5 Z"
-              fill="#F5EFE0"
-              stroke="#1E2022"
-              strokeWidth="1.1"
-              strokeLinejoin="round"
-            />
-            <circle cx="36.3" cy="6.2" r="1.5" fill="#1E2022" />
-            <circle cx="36.7" cy="5.8" r="0.5" fill="#FFFFFF" />
-            <path
-              d="M7 36 L57 36 L53.5 59.5 Q53 60.5 52 60.5 L12 60.5 Q11 60.5 10.5 59.5 Z"
-              fill="#655A4E"
-              stroke="#807153"
-              strokeWidth="1.1"
-            />
-            <rect x="5" y="33.5" width="54" height="4.8" rx="1.8" fill="#655A4E" stroke="#807153" strokeWidth="1.1" />
-          </svg>
-          <span className="text-lg font-bold tracking-tight text-white whitespace-nowrap">
-            NostrAuction <span className="text-amber-400 font-mono text-xs ml-1 px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">AUCTION TERMINAL</span>
-          </span>
+            <Settings2 className="w-3.5 h-3.5" />
+            Configure Auction
+          </button>
         </div>
 
-        {/* Zone 2: 4-5 clean single-line text navigation links */}
+        {/* Desktop navigation links */}
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
           <a href="#auction-hero" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Auction Details</a>
           <a href="#highest-bidder" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Highest Bid</a>
@@ -869,9 +884,10 @@ export default function App() {
           <a href="#relays" className="hover:text-amber-400 transition-colors whitespace-nowrap shrink-0">Relays</a>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center gap-3 shrink-0">
+        {/* Desktop action button */}
+        <div className="hidden md:flex items-center gap-3 shrink-0">
           <button 
+            type="button"
             onClick={() => setShowTesterModal(true)}
             disabled={auctionFinalized && wasLiveBeforeClose}
             className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg shadow-amber-400/10 whitespace-nowrap shrink-0 cursor-pointer"
@@ -1162,7 +1178,7 @@ export default function App() {
             </div>
 
             {sortedBids.length > 0 ? (
-              <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+              <div className="space-y-3 md:max-h-[500px] md:overflow-y-auto md:pr-2">
                 {sortedBids.map((bid) => {
                   const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
                   const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
@@ -1178,37 +1194,37 @@ export default function App() {
                             : 'bg-slate-950/30 border-slate-900 opacity-60'
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-4 mb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono text-xs text-amber-400 font-semibold">{truncatePubkey(bid.pubkey)}</span>
-                          <span className="text-slate-600">·</span>
-                          <span className="font-mono text-xs text-slate-400">{new Date(bid.createdAt * 1000).toLocaleTimeString()}</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {isHighest && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
-                              Highest
-                            </span>
-                          )}
-                          {isAfterCutoff && (
-                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 uppercase tracking-wider">
-                              Post-Block
-                            </span>
-                          )}
-                          <span className={`font-mono text-sm font-bold tabular-nums ${isValid ? 'text-white' : 'text-slate-400'}`}>
-                            {bid.amountSats.toLocaleString()} sats
-                          </span>
-                        </div>
-                      </div>
-                      <p className="text-sm text-slate-300 font-mono">
-                        {bid.content}
-                      </p>
-                      <div className="flex items-center justify-between mt-3 pt-2 border-t border-slate-800/50 text-[11px] font-mono text-slate-400">
-                        <span>Relay: {bid.relayUrl.replace('wss://', '')}</span>
-                        <a href={`https://njump.me/${bid.id}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1">
-                          Note ID: {bid.id.substring(0, 8)}... <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
+<div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+  <div className="flex flex-wrap items-center gap-2 min-w-0">
+    <span className="font-mono text-xs text-amber-400 font-semibold">{truncatePubkey(bid.pubkey)}</span>
+    <span className="text-slate-600">·</span>
+    <span className="font-mono text-xs text-slate-400">{new Date(bid.createdAt * 1000).toLocaleTimeString()}</span>
+  </div>
+  <div className="flex flex-wrap items-center gap-2 shrink-0">
+    {isHighest && (
+      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
+        Highest
+      </span>
+    )}
+    {isAfterCutoff && (
+      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 uppercase tracking-wider">
+        Post-Block
+      </span>
+    )}
+    <span className={`font-mono text-sm font-bold tabular-nums ${isValid ? 'text-white' : 'text-slate-400'}`}>
+      {bid.amountSats.toLocaleString()} sats
+    </span>
+  </div>
+</div>
+<p className="text-sm text-slate-300 font-mono break-words">
+  {bid.content}
+</p>
+<div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2 border-t border-slate-800/50 text-[11px] font-mono text-slate-400">
+  <span className="break-all">Relay: {bid.relayUrl.replace('wss://', '')}</span>
+  <a href={`https://njump.me/${bid.id}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1 shrink-0">
+    Note ID: {bid.id.substring(0, 8)}... <ExternalLink className="w-3 h-3" />
+  </a>
+</div>
                     </div>
                   );
                 })}
@@ -1313,14 +1329,38 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-xs font-mono text-slate-300 mb-1">Optional Thread Anchor (nevent / note1 / ID)</label>
-                <input
-                  type="text"
-                  value={anchorInput}
-                  onChange={e => setAnchorInput(e.target.value)}
-                  placeholder="Leave blank unless anchoring a secondary thread event"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
-                />
+                {!showAnchorField && !anchorInput.trim() ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowAnchorField(true)}
+                    className="text-xs font-mono text-amber-400 hover:text-amber-300 transition-colors cursor-pointer"
+                  >
+                    + Also track another note
+                  </button>
+                ) : (
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-mono text-slate-300">Also Track Another Note (Optional)</label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAnchorInput('');
+                          setShowAnchorField(false);
+                        }}
+                        className="text-[11px] font-mono text-slate-400 hover:text-slate-200 cursor-pointer"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                    <input
+                      type="text"
+                      value={anchorInput}
+                      onChange={e => setAnchorInput(e.target.value)}
+                      placeholder="Paste another nevent, note1, or event ID"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -1353,6 +1393,7 @@ export default function App() {
                   onClick={() => {
                     setNeventInput(DEFAULT_TEST_NEVENT);
                     setAnchorInput('');
+                    setShowAnchorField(false);
                     setStartingBidInput(String(DEFAULT_STARTING_BID));
                     setTargetBlockInput(String(DEFAULT_TARGET_BLOCK));
                     setShowTesterModal(false);
