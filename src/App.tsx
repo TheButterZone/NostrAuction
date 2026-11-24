@@ -1155,23 +1155,28 @@ export default function App() {
           <div className="rounded-2xl bg-gradient-to-r from-emerald-950/80 via-slate-900 to-amber-950/50 border border-emerald-500/40 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
             <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
-              <div className="flex items-start gap-4">
+              <div className="flex items-start gap-4 min-w-0">
                 <div className="w-12 h-12 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
                   <Award className="w-6 h-6" />
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400 font-mono uppercase tracking-wider mb-1">
                     <CheckCircle2 className="w-3.5 h-3.5" /> Auction Concluded at Block #{targetBlockNum}
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
                     Winning Bid Confirmed: {displayedWinner.amountSats.toLocaleString()} sats ({formatBtc(displayedWinner.amountSats)})
                   </h2>
-                  <p className="text-sm text-slate-300 mt-1">
+                  <p className="text-sm text-slate-300 mt-1 break-words">
                     Winner Npub: <span className="font-mono text-amber-300">{truncatePubkey(displayedWinner.pubkey)}</span> · Event ID: <span className="font-mono text-slate-400 text-xs">{displayedWinner.id.substring(0, 16)}...</span>
                   </p>
+                  {wasLiveBeforeClose && winnerDisplayedAt && (
+                    <p className="text-[11px] text-slate-400 font-mono mt-1.5 break-words">
+                      Winner displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                    </p>
+                  )}
                 </div>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 shrink-0">
                 <a 
                   href={`https://njump.me/${displayedWinner.id}`} 
                   target="_blank" 
@@ -1180,11 +1185,6 @@ export default function App() {
                 >
                   View Winning Note on Njump <ExternalLink className="w-3.5 h-3.5" />
                 </a>
-                {wasLiveBeforeClose && winnerDisplayedAt && (
-                  <span className="text-[11px] text-slate-400 font-mono whitespace-nowrap">
-                    Winner displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
-                  </span>
-                )}
               </div>
             </div>
           </div>
