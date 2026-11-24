@@ -139,6 +139,7 @@ export default function App() {
   const [relaysStatus, setRelaysStatus] = useState<RelayStatus[]>([]);
   const [isListening, setIsListening] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [copiedAnnouncement, setCopiedAnnouncement] = useState<boolean>(false);
   const [showTesterModal, setShowTesterModal] = useState<boolean>(false);
   const [finalizedWinner, setFinalizedWinner] = useState<Bid | null>(null);
   const [winnerDisplayedAt, setWinnerDisplayedAt] = useState<string | null>(null);
@@ -1003,6 +1004,78 @@ export default function App() {
     return (sats / 100000000).toFixed(8) + " BTC";
   };
 
+  const buildWinnerAnnouncementText = useCallback((winner: Bid): string => {
+    let winnerNpub = winner.pubkey;
+    let hexPubkey = '';
+
+    if (winner.pubkey.startsWith('npub1')) {
+      try {
+        const decoded = nip19.decode(winner.pubkey);
+        if (decoded.type === 'npub' && typeof decoded.data === 'string') {
+          hexPubkey = decoded.data;
+        }
+      } catch {
+        // Keep raw npub string if decode fails
+      }
+    } else if (/^[0-9a-fA-F]{64}$/.test(winner.pubkey)) {
+      hexPubkey = winner.pubkey.toLowerCase();
+      try {
+        winnerNpub = nip19.npubEncode(hexPubkey);
+      } catch {
+        winnerNpub = winner.pubkey;
+      }
+    }
+
+    let winnerNeventRef = winner.id;
+    try {
+      winnerNeventRef = nip19.neventEncode({
+        id: winner.id,
+        ...(hexPubkey ? { author: hexPubkey } : {}),
+        relays: decodedRelays.slice(0, 3),
+      });
+    } catch {
+      winnerNeventRef = winner.id;
+    }
+
+    const lines = [
+      `Auction closed at Bitcoin block #${targetBlockNum.toLocaleString()}!`,
+      `Winning bid: ${winner.amountSats.toLocaleString()} sats (${formatBtc(winner.amountSats)})`,
+      `Winner: nostr:${winnerNpub}`,
+      `Winning bid: nostr:${winnerNeventRef}`,
+    ];
+
+    if (winnerDisplayedAt) {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      lines.push(`Winner displayed: ${new Date(winnerDisplayedAt).toLocaleString()} (${tz})`);
+    }
+
+    lines.push('Live-Witnessed on https://nostrauction.shakespeare.wtf');
+    return lines.join('\n');
+  }, [decodedRelays, targetBlockNum, winnerDisplayedAt]);
+
+  const copyWinnerAnnouncement = useCallback(async (winner: Bid) => {
+    const text = buildWinnerAnnouncementText(winner);
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+      } else {
+        throw new Error('Clipboard API unavailable');
+      }
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
+    setCopiedAnnouncement(true);
+    setTimeout(() => setCopiedAnnouncement(false), 2500);
+  }, [buildWinnerAnnouncementText]);
+
   const truncatePubkey = (pubkey: string) => {
     if (!pubkey) return 'Unknown';
     if (pubkey.startsWith('npub1')) {
@@ -1176,7 +1249,24 @@ export default function App() {
                   )}
                 </div>
               </div>
-              <div className="flex items-center gap-3 shrink-0">
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                {wasLiveBeforeClose && (
+                  <button
+                    type="button"
+                    onClick={() => copyWinnerAnnouncement(displayedWinner)}
+                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
+                  >
+                    {copiedAnnouncement ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" /> Copied Announcement!
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" /> Copy Winner Announcement
+                      </>
+                    )}
+                  </button>
+                )}
                 <a 
                   href={`https://njump.me/${displayedWinner.id}`} 
                   target="_blank" 
@@ -1235,7 +1325,7 @@ export default function App() {
                 </div>
 
                 <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/60 col-span-2 sm:col-span-1">
-                  <span className="text-xs text-slate-400 font-mono block mb-1">Total Valid Bids</span>
+                  <span className="text-xs text-slate-400 font-mono block mb-1">Qualifying Amount Mentions</span>
                   <span className="text-lg font-bold text-white font-mono tabular-nums">
                     {validBids.length}
                   </span>
@@ -1382,7 +1472,7 @@ export default function App() {
           ) : (
             <div className="text-center py-12 bg-slate-950/40 rounded-xl border border-slate-800/60">
               <AlertCircle className="w-8 h-8 text-amber-400 mx-auto mb-3 opacity-80" />
-              <p className="text-sm font-medium text-slate-300">No valid bids received yet at or above {startingBidNum.toLocaleString()} sats.</p>
+              <p className="text-sm font-medium text-slate-300">No sat amounts at or above {startingBidNum.toLocaleString()} sats spotted in the thread yet.</p>
               <p className="text-xs text-slate-400 mt-1 font-mono">Waiting for relay replies or use the tester panel to simulate bids.</p>
               <button
                 onClick={() => injectSimulatedBid(275000, "Satoshi")}
@@ -1408,7 +1498,7 @@ export default function App() {
                 <h2 className="text-lg font-bold text-white tracking-tight">Relay Bids (Sorted by Amount)</h2>
               </div>
               <span className="text-xs font-mono text-slate-400 bg-slate-800 px-3 py-1 rounded-full">
-                {sortedBids.length} Total Bids
+                {sortedBids.length} Notes With Amounts
               </span>
             </div>
 
@@ -1514,10 +1604,10 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800/80 bg-slate-900/40 py-6 px-6 text-center text-xs text-slate-400 font-mono">
-        <p>NostrAuction Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
+        <p><a href="https://github.com/TheButterZone/NostrAuction" target="_blank">NostrAuction Nostr Auction Terminal</a> · Powered by Decentralized Relays & Bitcoin Block Height Verification · <a href="bitcoin:bc1qn5kua7a4r7xasgnd6mt4k5huv45gcm3rs545u2">LLM war-coded by TheButterZone</a></p>
       </footer>
 
-{/* Configuration & Tester Modal */}
+      {/* Configuration & Tester Modal */}
       {showTesterModal && (
         <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/80 backdrop-blur-sm p-4 flex items-start sm:items-center justify-center">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full max-h-[calc(100dvh-2rem)] overflow-y-auto my-auto p-4 sm:p-6 shadow-2xl relative">
