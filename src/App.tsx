@@ -32,6 +32,8 @@ const DEFAULT_STARTING_BID = 250000;
 const DEFAULT_TARGET_BLOCK = 977136;
 const BLOCK_POLL_INTERVAL_MS = 60000; // every 60s
 const BATCH_FLUSH_DELAY_MS = 120;
+const RELAY_WATCHDOG_INTERVAL_MS = 5000;
+const RELAY_HEARTBEAT_INTERVAL_MS = 30000;
 
 const DEFAULT_RELAYS = [
   "wss://nos.lol",
@@ -319,7 +321,7 @@ export default function App() {
     fetchBlockHeight();
   }, [fetchBlockHeight]);
 
-  // Instant block updates via mempool.space WebSocket with reconnect backoff (stable lifecycle)
+  // Instant block updates via mempool.space WebSocket with reconnect backoff & tab wake-up recovery
   useEffect(() => {
     let closedByCleanup = false;
     let reconnectAttempt = 0;
@@ -332,8 +334,36 @@ export default function App() {
       setWsBlockConnected(connected);
     };
 
+    const clearReconnectTimer = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
     const connectBlockWs = () => {
       if (closedByCleanup) return;
+      clearReconnectTimer();
+
+      if (activeWs) {
+        if (activeWs.readyState === WebSocket.OPEN) {
+          try {
+            activeWs.send(JSON.stringify({ action: "want", data: ["blocks"] }));
+          } catch {
+            // Safe send
+          }
+          return;
+        }
+        if (activeWs.readyState === WebSocket.CONNECTING) {
+          return;
+        }
+        try {
+          activeWs.close();
+        } catch {
+          // Safe close
+        }
+      }
+
       try {
         const ws = new WebSocket('wss://mempool.space/api/v1/ws');
         activeWs = ws;
@@ -394,6 +424,41 @@ export default function App() {
       }
     };
 
+    const wakeUpBlockStream = () => {
+      if (closedByCleanup) return;
+      fetchBlockHeight();
+      if (!activeWs || (activeWs.readyState !== WebSocket.OPEN && activeWs.readyState !== WebSocket.CONNECTING)) {
+        reconnectAttempt = 0;
+        connectBlockWs();
+      } else if (activeWs.readyState === WebSocket.OPEN) {
+        try {
+          activeWs.send(JSON.stringify({ action: "want", data: ["blocks"] }));
+        } catch {
+          // Safe send
+        }
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        wakeUpBlockStream();
+      }
+    };
+
+    const onFocus = () => {
+      wakeUpBlockStream();
+    };
+
+    const onOnline = () => {
+      wakeUpBlockStream();
+    };
+
+    if (typeof window !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange);
+      window.addEventListener('focus', onFocus);
+      window.addEventListener('online', onOnline);
+    }
+
     connectBlockWs();
 
     fallbackPollTimer = setInterval(() => {
@@ -405,7 +470,12 @@ export default function App() {
     return () => {
       closedByCleanup = true;
       setConnectedState(false);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (typeof window !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        window.removeEventListener('focus', onFocus);
+        window.removeEventListener('online', onOnline);
+      }
+      clearReconnectTimer();
       if (fallbackPollTimer) clearInterval(fallbackPollTimer);
       if (activeWs && (activeWs.readyState === WebSocket.OPEN || activeWs.readyState === WebSocket.CONNECTING)) {
         activeWs.close();
@@ -432,17 +502,20 @@ export default function App() {
     : highestBid;
   const connectedRelays = relaysStatus.filter(r => r.connected);
 
-  // Connect to Relays WebSocket with batched deduplicated ID walking & per-relay EOSE tracking
+  // Connect to Relays WebSocket with jittered backoff, watchdog, tab wake-up, and batched ID walking
   useEffect(() => {
     if (!decodedEventId || decodedRelays.length === 0) return;
 
     // A live auction already locked at its target block must never reconnect to relays.
-    if (liveCloseLockedRef.current) return;
+    if (liveCloseLockedRef.current || auctionFinalized) return;
 
     setIsListening(true);
     setBids([]);
     bidsRef.current = [];
-    const newWsRefs: { [url: string]: WebSocket } = {};
+
+    const sockets = new Map<string, WebSocket>();
+    const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    const reconnectAttempts = new Map<string, number>();
     let stopped = false;
 
     const rootEventIds = Array.from(
@@ -458,27 +531,59 @@ export default function App() {
     const relayPendingSubs = new Map<string, Set<string>>(); // relayUrl -> Set<subId>
 
     let batchTimer: ReturnType<typeof setTimeout> | null = null;
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const canKeepReconnecting = () => !stopped && !liveCloseLockedRef.current;
+
+    const clearReconnectTimer = (url: string) => {
+      const timer = reconnectTimers.get(url);
+      if (timer) {
+        clearTimeout(timer);
+        reconnectTimers.delete(url);
+      }
+    };
+
+    const cleanupLifecycleListeners = () => {
+      if (typeof window !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        window.removeEventListener('focus', onFocus);
+        window.removeEventListener('online', onOnline);
+      }
+    };
 
     const stopConnections = () => {
       if (stopped) return;
       stopped = true;
+      cleanupLifecycleListeners();
       if (batchTimer !== null) {
         clearTimeout(batchTimer);
         batchTimer = null;
       }
+      if (watchdogTimer !== null) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      reconnectTimers.forEach(timer => clearTimeout(timer));
+      reconnectTimers.clear();
       pendingBatchIds.clear();
-      Object.values(newWsRefs).forEach(sock => {
+      sockets.forEach(sock => {
         if (sock.readyState === WebSocket.OPEN || sock.readyState === WebSocket.CONNECTING) {
           try { sock.close(); } catch (e) { console.warn("Failed to close relay socket:", e); }
         }
       });
+      sockets.clear();
       setIsListening(false);
       setRelaysStatus(prev => prev.map(r => ({ ...r, connected: false })));
     };
     stopRelayConnectionsRef.current = stopConnections;
 
     const markRelayEoseIfReady = (relayUrl: string) => {
-      if (stopped || liveCloseLockedRef.current) return;
+      if (!canKeepReconnecting()) return;
       const pending = relayPendingSubs.get(relayUrl);
       if (!pending || pending.size === 0) {
         setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, eoseReceived: true } : r));
@@ -486,7 +591,7 @@ export default function App() {
     };
 
     const registerSubscription = (ws: WebSocket, relayUrl: string, subId: string, filter: Record<string, any>) => {
-      if (stopped || liveCloseLockedRef.current) return;
+      if (!canKeepReconnecting()) return;
       activeSubRelayMap.set(subId, relayUrl);
       let setForRelay = relayPendingSubs.get(relayUrl);
       if (!setForRelay) {
@@ -501,9 +606,26 @@ export default function App() {
       }
     };
 
+    const sendRootSubscriptions = (sock: WebSocket, relayUrl: string) => {
+      if (!canKeepReconnecting() || sock.readyState !== WebSocket.OPEN) return;
+      relayPendingSubs.set(relayUrl, new Set<string>());
+      const allKnownIds = Array.from(discoveredEventIds);
+      const initToken = Math.random().toString(36).substring(2, 8);
+
+      registerSubscription(sock, relayUrl, `roots_e_${initToken}`, { kinds: [1, 1111], '#e': allKnownIds, limit: 500 });
+      registerSubscription(sock, relayUrl, `roots_E_${initToken}`, { kinds: [1, 1111], '#E': allKnownIds, limit: 500 });
+      registerSubscription(sock, relayUrl, `roots_ids_${initToken}`, { kinds: [1, 1111], ids: allKnownIds, limit: 250 });
+
+      if (authorPubkey) {
+        registerSubscription(sock, relayUrl, `author_${initToken}`, { kinds: [1, 1111], authors: [authorPubkey], limit: 250 });
+      }
+
+      markRelayEoseIfReady(relayUrl);
+    };
+
     const flushBatchedWalkIds = () => {
       batchTimer = null;
-      if (stopped || liveCloseLockedRef.current) return;
+      if (!canKeepReconnecting()) return;
       if (pendingBatchIds.size === 0) return;
 
       const batch = Array.from(pendingBatchIds);
@@ -511,7 +633,7 @@ export default function App() {
 
       const batchToken = `${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
 
-      Object.entries(newWsRefs).forEach(([relayUrl, sock]) => {
+      sockets.forEach((sock, relayUrl) => {
         if (sock.readyState === WebSocket.OPEN) {
           const subE = `walk_e_${batchToken}`;
           const subUpperE = `walk_E_${batchToken}`;
@@ -525,7 +647,7 @@ export default function App() {
     };
 
     const scheduleWalkTargets = (targets: string[]) => {
-      if (stopped || liveCloseLockedRef.current) return;
+      if (!canKeepReconnecting()) return;
       let addedAny = false;
       for (const rawId of targets) {
         const targetId = rawId.toLowerCase();
@@ -541,7 +663,7 @@ export default function App() {
     };
 
     const acceptThreadEvent = (ev: any, eventRefTags: string[], relayUrl: string) => {
-      if (stopped || liveCloseLockedRef.current) return;
+      if (!canKeepReconnecting()) return;
       const evId = ev.id.toLowerCase();
       parseAndAddBid({ ...ev, id: evId, pubkey: ev.pubkey.toLowerCase() }, relayUrl, seenEventIds);
 
@@ -561,34 +683,45 @@ export default function App() {
       }
     };
 
-    decodedRelays.forEach(relayUrl => {
+    const connectRelay = (relayUrl: string, immediate = false) => {
+      if (!canKeepReconnecting()) return;
+      clearReconnectTimer(relayUrl);
+
+      const existing = sockets.get(relayUrl);
+      if (existing) {
+        if (existing.readyState === WebSocket.OPEN) {
+          sendRootSubscriptions(existing, relayUrl);
+          return;
+        }
+        if (existing.readyState === WebSocket.CONNECTING) {
+          return;
+        }
+        try {
+          existing.close();
+        } catch {
+          // Safe close
+        }
+      }
+
       try {
         const ws = new WebSocket(relayUrl);
-        newWsRefs[relayUrl] = ws;
+        sockets.set(relayUrl, ws);
 
         ws.onopen = () => {
-          if (stopped || liveCloseLockedRef.current) { ws.close(); return; }
-          relayPendingSubs.set(relayUrl, new Set<string>());
-          setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, eoseReceived: false, error: undefined } : r));
-
-          const allKnownIds = Array.from(discoveredEventIds);
-          const initToken = Math.random().toString(36).substring(2, 8);
-
-          // 1. Batched root subscriptions (#e, #E, and direct ids across kinds 1 and 1111)
-          registerSubscription(ws, relayUrl, `roots_e_${initToken}`, { kinds: [1, 1111], '#e': allKnownIds, limit: 500 });
-          registerSubscription(ws, relayUrl, `roots_E_${initToken}`, { kinds: [1, 1111], '#E': allKnownIds, limit: 500 });
-          registerSubscription(ws, relayUrl, `roots_ids_${initToken}`, { kinds: [1, 1111], ids: allKnownIds, limit: 250 });
-
-          // 2. Author notes query if authorPubkey is known
-          if (authorPubkey) {
-            registerSubscription(ws, relayUrl, `author_${initToken}`, { kinds: [1, 1111], authors: [authorPubkey], limit: 250 });
+          if (!canKeepReconnecting() || sockets.get(relayUrl) !== ws) {
+            ws.close();
+            return;
           }
-
-          markRelayEoseIfReady(relayUrl);
+          reconnectAttempts.set(relayUrl, 0);
+          setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: true, eoseReceived: false, error: undefined } : r));
+          sendRootSubscriptions(ws, relayUrl);
+          if (pendingBatchIds.size > 0 && batchTimer === null) {
+            batchTimer = setTimeout(flushBatchedWalkIds, BATCH_FLUSH_DELAY_MS);
+          }
         };
 
         ws.onmessage = (event) => {
-          if (stopped || liveCloseLockedRef.current) return;
+          if (!canKeepReconnecting() || sockets.get(relayUrl) !== ws) return;
           try {
             const data = JSON.parse(event.data);
             if (!Array.isArray(data)) return;
@@ -635,18 +768,120 @@ export default function App() {
         };
 
         ws.onerror = (err) => {
-          if (stopped) return;
+          if (!canKeepReconnecting()) return;
           console.warn("Relay error:", relayUrl, err);
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: false, error: 'Connection error' } : r));
+          scheduleReconnect(relayUrl, immediate);
         };
 
         ws.onclose = () => {
+          if (sockets.get(relayUrl) === ws) {
+            sockets.delete(relayUrl);
+          }
           setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: false } : r));
+          if (canKeepReconnecting()) {
+            scheduleReconnect(relayUrl, immediate);
+          }
         };
       } catch (e) {
         console.error("Failed to connect to relay", relayUrl, e);
+        setRelaysStatus(prev => prev.map(r => r.url === relayUrl ? { ...r, connected: false, error: 'Connection failed' } : r));
+        if (canKeepReconnecting()) {
+          scheduleReconnect(relayUrl, immediate);
+        }
       }
+    };
+
+    const scheduleReconnect = (relayUrl: string, immediate = false) => {
+      if (!canKeepReconnecting()) return;
+      clearReconnectTimer(relayUrl);
+
+      if (immediate) {
+        reconnectAttempts.set(relayUrl, 0);
+        connectRelay(relayUrl, false);
+        return;
+      }
+
+      const attempts = (reconnectAttempts.get(relayUrl) || 0) + 1;
+      reconnectAttempts.set(relayUrl, attempts);
+
+      // Jittered exponential backoff: 1.5s * 1.5^(n-1) capped at 15s + up to 800ms jitter
+      const baseDelay = Math.min(1500 * Math.pow(1.5, Math.min(attempts - 1, 6)), 15000);
+      const jitter = Math.random() * 800;
+      const timer = setTimeout(() => {
+        reconnectTimers.delete(relayUrl);
+        if (canKeepReconnecting()) {
+          connectRelay(relayUrl, false);
+        }
+      }, baseDelay + jitter);
+
+      reconnectTimers.set(relayUrl, timer);
+    };
+
+    const wakeUpAndAudit = () => {
+      if (!canKeepReconnecting()) return;
+      decodedRelays.forEach(relayUrl => {
+        const ws = sockets.get(relayUrl);
+        const isOpen = ws && ws.readyState === WebSocket.OPEN;
+        const isConnecting = ws && ws.readyState === WebSocket.CONNECTING;
+
+        if (!isOpen && !isConnecting) {
+          clearReconnectTimer(relayUrl);
+          connectRelay(relayUrl, true);
+        } else if (isOpen && ws) {
+          sendRootSubscriptions(ws, relayUrl);
+        }
+      });
+    };
+
+    const onVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        wakeUpAndAudit();
+      }
+    };
+
+    const onFocus = () => {
+      wakeUpAndAudit();
+    };
+
+    const onOnline = () => {
+      wakeUpAndAudit();
+    };
+
+    if (typeof window !== 'undefined') {
+      document.addEventListener('visibilitychange', onVisibilityChange);
+      window.addEventListener('focus', onFocus);
+      window.addEventListener('online', onOnline);
+    }
+
+    decodedRelays.forEach(relayUrl => {
+      connectRelay(relayUrl, false);
     });
+
+    watchdogTimer = setInterval(() => {
+      if (!canKeepReconnecting()) return;
+      decodedRelays.forEach(relayUrl => {
+        const ws = sockets.get(relayUrl);
+        const isOpen = ws && ws.readyState === WebSocket.OPEN;
+        const isConnecting = ws && ws.readyState === WebSocket.CONNECTING;
+        if (!isOpen && !isConnecting && !reconnectTimers.has(relayUrl)) {
+          scheduleReconnect(relayUrl, false);
+        }
+      });
+    }, RELAY_WATCHDOG_INTERVAL_MS);
+
+    heartbeatTimer = setInterval(() => {
+      if (!canKeepReconnecting()) return;
+      sockets.forEach((ws, relayUrl) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            sendRootSubscriptions(ws, relayUrl);
+          } catch {
+            scheduleReconnect(relayUrl, true);
+          }
+        }
+      });
+    }, RELAY_HEARTBEAT_INTERVAL_MS);
 
     return () => {
       stopConnections();
@@ -654,7 +889,7 @@ export default function App() {
         stopRelayConnectionsRef.current = null;
       }
     };
-  }, [decodedEventId, anchorEventId, decodedRelays, authorPubkey]);
+  }, [decodedEventId, anchorEventId, decodedRelays, authorPubkey, auctionFinalized]);
 
   // Parse Nostr event content to extract bid amounts in satoshis across nested threads
   const parseAndAddBid = (ev: any, relayUrl: string, seenSet?: Set<string>) => {
@@ -1194,37 +1429,37 @@ export default function App() {
                             : 'bg-slate-950/30 border-slate-900 opacity-60'
                       }`}
                     >
-<div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-  <div className="flex flex-wrap items-center gap-2 min-w-0">
-    <span className="font-mono text-xs text-amber-400 font-semibold">{truncatePubkey(bid.pubkey)}</span>
-    <span className="text-slate-600">·</span>
-    <span className="font-mono text-xs text-slate-400">{new Date(bid.createdAt * 1000).toLocaleTimeString()}</span>
-  </div>
-  <div className="flex flex-wrap items-center gap-2 shrink-0">
-    {isHighest && (
-      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
-        Highest
-      </span>
-    )}
-    {isAfterCutoff && (
-      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 uppercase tracking-wider">
-        Post-Block
-      </span>
-    )}
-    <span className={`font-mono text-sm font-bold tabular-nums ${isValid ? 'text-white' : 'text-slate-400'}`}>
-      {bid.amountSats.toLocaleString()} sats
-    </span>
-  </div>
-</div>
-<p className="text-sm text-slate-300 font-mono break-words">
-  {bid.content}
-</p>
-<div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2 border-t border-slate-800/50 text-[11px] font-mono text-slate-400">
-  <span className="break-all">Relay: {bid.relayUrl.replace('wss://', '')}</span>
-  <a href={`https://njump.me/${bid.id}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1 shrink-0">
-    Note ID: {bid.id.substring(0, 8)}... <ExternalLink className="w-3 h-3" />
-  </a>
-</div>
+                      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                        <div className="flex flex-wrap items-center gap-2 min-w-0">
+                          <span className="font-mono text-xs text-amber-400 font-semibold">{truncatePubkey(bid.pubkey)}</span>
+                          <span className="text-slate-600">·</span>
+                          <span className="font-mono text-xs text-slate-400">{new Date(bid.createdAt * 1000).toLocaleTimeString()}</span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {isHighest && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
+                              Highest
+                            </span>
+                          )}
+                          {isAfterCutoff && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/30 uppercase tracking-wider">
+                              Post-Block
+                            </span>
+                          )}
+                          <span className={`font-mono text-sm font-bold tabular-nums ${isValid ? 'text-white' : 'text-slate-400'}`}>
+                            {bid.amountSats.toLocaleString()} sats
+                          </span>
+                        </div>
+                      </div>
+                      <p className="text-sm text-slate-300 font-mono break-words">
+                        {bid.content}
+                      </p>
+                      <div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2 border-t border-slate-800/50 text-[11px] font-mono text-slate-400">
+                        <span className="break-all">Relay: {bid.relayUrl.replace('wss://', '')}</span>
+                        <a href={`https://njump.me/${bid.id}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1 shrink-0">
+                          Note ID: {bid.id.substring(0, 8)}... <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
                     </div>
                   );
                 })}
@@ -1303,18 +1538,18 @@ export default function App() {
               <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-4 space-y-2">
                 <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
                   <span>⚠</span>
-                  <span>IMPORTANT: KEEP THIS AUCTION TAB OPEN</span>
+                  <span>KEEP THIS TAB OPEN FOR LIVE-WITNESSED CLOSE</span>
                 </div>
                 <p className="text-xs text-amber-100/90 leading-relaxed">
-                  To enable Live-Witnessed finalization, open this auction before its closing block is mined and keep this tab open, pinned, and connected to Mempool until the auction closes.
+                  Nostr relay connections automatically reconnect in the background, so backgrounded tabs will still catch up on bids. However, to lock in <strong>Live-Witnessed</strong> finalization at the closing block, open the auction before close and keep this tab open and connected to Mempool until the block is mined.
                 </p>
                 <ul className="list-disc pl-5 space-y-1 text-xs text-amber-100/90 leading-relaxed">
-                  <li>Do not close, refresh, or navigate away from this tab.</li>
-                  <li>Keep your browser running and your device awake.</li>
-                  <li>Keep an eye on the Mempool WS connection status.</li>
+                  <li>Avoid closing or refreshing the tab around the closing block.</li>
+                  <li>Keep your browser running and your device awake near close.</li>
+                  <li>Check the Mempool WS status if the tab was sleeping.</li>
                 </ul>
                 <p className="text-xs text-amber-200 font-semibold leading-relaxed">
-                  If you open or reload the auction after its closing block has been mined, the auction cannot be Live-Witnessed. The winner may display with a Not Live-Witnessed caveat.
+                  If you open or reload after the closing block is already mined, it cannot be marked Live-Witnessed and will show a historical caveat.
                 </p>
               </div>
 
