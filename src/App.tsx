@@ -1517,26 +1517,28 @@ export default function App() {
         <p>NostrAuction Nostr Auction Terminal · Powered by Decentralized Relays & Bitcoin Block Height Verification</p>
       </footer>
 
-      {/* Configuration & Tester Modal */}
+{/* Configuration & Tester Modal */}
       {showTesterModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl relative animate-fade-in">
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Settings2 className="w-5 h-5 text-amber-400" /> Configure & Test Auction
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/80 backdrop-blur-sm p-4 flex items-start sm:items-center justify-center">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full max-h-[calc(100dvh-2rem)] overflow-y-auto my-auto p-4 sm:p-6 shadow-2xl relative">
+            <div className="flex items-center justify-between mb-4 sm:mb-6">
+              <h3 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+                <Settings2 className="w-5 h-5 text-amber-400 shrink-0" /> Configure & Test Auction
               </h3>
-              <button 
+              <button
+                type="button"
                 onClick={() => setShowTesterModal(false)}
-                className="text-slate-400 hover:text-white font-mono text-sm"
+                aria-label="Close modal"
+                className="text-slate-400 hover:text-white font-mono text-sm p-1 cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
-            <div className="space-y-4">
+            <div className="space-y-3 sm:space-y-4">
               {/* Live-Witness Warning */}
-              <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-4 space-y-2">
-                <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
+              <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-3 sm:p-4 space-y-2">
+                <div className="flex items-center gap-2 text-amber-400 font-bold text-xs sm:text-sm">
                   <span>⚠</span>
                   <span>KEEP THIS TAB OPEN FOR LIVE-WITNESSED CLOSE</span>
                 </div>
@@ -1559,7 +1561,7 @@ export default function App() {
                   type="text"
                   value={neventInput}
                   onChange={e => setNeventInput(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
                 />
               </div>
 
@@ -1592,13 +1594,13 @@ export default function App() {
                       value={anchorInput}
                       onChange={e => setAnchorInput(e.target.value)}
                       placeholder="Paste another nevent, note1, or event ID"
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
                     />
                   </div>
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
                 <div>
                   <label className="block text-xs font-mono text-slate-300 mb-1">Starting Bid (sats)</label>
                   <input
@@ -1606,7 +1608,7 @@ export default function App() {
                     min={0}
                     value={startingBidInput}
                     onChange={e => setStartingBidInput(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
                   />
                 </div>
                 <div>
@@ -1616,15 +1618,16 @@ export default function App() {
                     min={0}
                     value={targetBlockInput}
                     onChange={e => setTargetBlockInput(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-sm font-mono text-slate-100 focus:outline-none focus:border-amber-500"
                   />
                 </div>
               </div>
 
               {/* Quick Test Case Loader */}
-              <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/80">
+              <div className="bg-slate-950/50 p-3.5 sm:p-4 rounded-xl border border-slate-800/80">
                 <span className="text-xs font-mono text-amber-400 block mb-2 font-semibold">⚡ Load User Test Case</span>
                 <button
+                  type="button"
                   onClick={() => {
                     setNeventInput(DEFAULT_TEST_NEVENT);
                     setAnchorInput('');
@@ -1633,7 +1636,7 @@ export default function App() {
                     setTargetBlockInput(String(DEFAULT_TARGET_BLOCK));
                     setShowTesterModal(false);
                   }}
-                  className="w-full py-2 px-3 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-mono rounded-lg border border-amber-500/30 transition-colors text-left flex items-center justify-between"
+                  className="w-full py-2 px-3 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-mono rounded-lg border border-amber-500/30 transition-colors text-left flex items-center justify-between cursor-pointer"
                 >
                   <span>Test Event #{DEFAULT_TARGET_BLOCK} ({DEFAULT_STARTING_BID.toLocaleString()} sats)</span>
                   <span className="text-amber-400">Load →</span>
@@ -1641,40 +1644,43 @@ export default function App() {
               </div>
 
               {/* Simulate Incoming Bids */}
-              <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/80">
+              <div className="bg-slate-950/50 p-3.5 sm:p-4 rounded-xl border border-slate-800/80">
                 <span className="text-xs font-mono text-slate-300 block mb-2 font-semibold">Simulate Incoming Relay Bid</span>
                 <div className="grid grid-cols-2 gap-2">
                   <button
+                    type="button"
                     onClick={() => {
                       injectSimulatedBid(320000, "CyberSatoshi");
                     }}
                     disabled={liveCloseLockedRef.current}
-                    className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center"
+                    className="py-2 px-3 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center cursor-pointer"
                   >
                     Bid 320,000 sats
                   </button>
                   <button
+                    type="button"
                     onClick={() => {
                       injectSimulatedBid(400000, "LightningWhale");
                     }}
                     disabled={liveCloseLockedRef.current}
-                    className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center"
+                    className="py-2 px-3 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 text-xs font-mono rounded-lg transition-colors text-center cursor-pointer"
                   >
                     Bid 400,000 sats
                   </button>
                 </div>
               </div>
-
             </div>
 
-            <div className="flex items-center justify-end gap-3 mt-6 pt-4 border-t border-slate-800">
+            <div className="sticky bottom-0 flex items-center justify-end gap-3 mt-4 sm:mt-6 pt-3 sm:pt-4 pb-1 border-t border-slate-800 bg-slate-900">
               <button
+                type="button"
                 onClick={() => setShowTesterModal(false)}
-                className="px-4 py-2 text-xs font-semibold text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors"
+                className="px-4 py-2 text-xs font-semibold text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors cursor-pointer"
               >
                 Close
               </button>
               <button
+                type="button"
                 onClick={() => {
                   setShowTesterModal(false);
                   const url = new URL(window.location.href);
@@ -1688,7 +1694,7 @@ export default function App() {
                   url.searchParams.set('block', targetBlockInput);
                   window.history.pushState({}, '', url.toString());
                 }}
-                className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg"
+                className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg cursor-pointer"
               >
                 Apply & Update Nsite
               </button>
