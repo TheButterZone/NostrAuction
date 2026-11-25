@@ -1348,7 +1348,7 @@ export default function App() {
                   {copiedLink ? 'Copied Share URL!' : 'Share Nsite URL'}
                 </button>
                 <a
-                  href={`https://njump.me/${neventInput}`}
+                  href={`https://njump.me/${encodeURIComponent(neventInput.trim() || DEFAULT_TEST_NEVENT)}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors border border-slate-700"
