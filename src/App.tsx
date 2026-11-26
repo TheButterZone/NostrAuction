@@ -92,6 +92,10 @@ function compareBidsByAmount(a: Bid, b: Bid): number {
   return a.id.localeCompare(b.id);
 }
 
+function normalizePubkey(pubkey: string): string {
+  return (pubkey || '').trim().toLowerCase();
+}
+
 function resolveTopBids(
   candidates: Bid[],
   startingBidSats: number,
@@ -108,15 +112,135 @@ function resolveTopBids(
   }
 
   const maxAmount = Math.max(...qualifying.map(b => b.amountSats));
-  const atMax = qualifying
-    .filter(b => b.amountSats === maxAmount)
-    .sort((a, b) => a.id.localeCompare(b.id));
+  const atMax = qualifying.filter(b => b.amountSats === maxAmount);
 
-  if (atMax.length > 1) {
-    return { winner: null, tiedWinners: atMax, topAmountSats: maxAmount };
+  // Deduplicate by normalized pubkey so repeat posts of the same top amount by one npub do not self-tie
+  const bestByPubkey = new Map<string, Bid>();
+  for (const bid of atMax) {
+    const key = normalizePubkey(bid.pubkey) || bid.id;
+    const existing = bestByPubkey.get(key);
+    if (
+      !existing ||
+      bid.createdAt < existing.createdAt ||
+      (bid.createdAt === existing.createdAt && bid.id.localeCompare(existing.id) < 0)
+    ) {
+      bestByPubkey.set(key, bid);
+    }
   }
 
-  return { winner: atMax[0], tiedWinners: [], topAmountSats: maxAmount };
+  const distinctTopBidders = Array.from(bestByPubkey.values()).sort((a, b) => {
+    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+    return a.id.localeCompare(b.id);
+  });
+
+  if (distinctTopBidders.length > 1) {
+    return { winner: null, tiedWinners: distinctTopBidders, topAmountSats: maxAmount };
+  }
+
+  return { winner: distinctTopBidders[0], tiedWinners: [], topAmountSats: maxAmount };
+}
+
+const NON_BID_CONTEXT_WORDS = new Set([
+  'block', 'blocks', 'height', 'hash', 'id', 'ids',
+  'note', 'notes', 'event', 'events', 'nevent', 'note1', 'npub', 'npub1', 'naddr', 'nprofile',
+  'tx', 'txid', 'year', 'yr', 'epoch', 'version', 'ver', 'port', 'channel'
+]);
+
+const UNIT_WORDS = new Set(['btc', 'sats', 'sat', 'satoshis', 'satoshi', 'k', 'm']);
+
+function isNonBidContext(text: string, matchStart: number, matchEnd: number, rawToken: string): boolean {
+  if (rawToken.startsWith('+') || rawToken.includes(' ') || rawToken.includes('_') || rawToken.includes("'")) {
+    return true;
+  }
+
+  const before = text.slice(0, matchStart);
+  const after = text.slice(matchEnd);
+
+  if (before.endsWith('#') || /[a-z0-9]$/.test(before)) {
+    return true;
+  }
+
+  const gluedAfterMatch = after.match(/^([a-z]+)/);
+  if (gluedAfterMatch && !UNIT_WORDS.has(gluedAfterMatch[1])) {
+    return true;
+  }
+
+  const prevWordMatch = before.match(/([a-z0-9]+)\s*[:=#-]?\s*$/);
+  if (prevWordMatch && NON_BID_CONTEXT_WORDS.has(prevWordMatch[1])) {
+    return true;
+  }
+
+  const nextWordMatch = after.match(/^\s*[:=#-]?\s*([a-z0-9]+)/);
+  if (nextWordMatch && NON_BID_CONTEXT_WORDS.has(nextWordMatch[1]) && !UNIT_WORDS.has(nextWordMatch[1])) {
+    return true;
+  }
+
+  return false;
+}
+
+export function extractSatsFromText(text: string, startingBidSats: number = 0): number | null {
+  if (!text) return null;
+
+  const sanitized = text
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\b(?:nevent1|note1|npub1|nprofile1|naddr1)[023456789acdefghjklmnpqrstuvwxyz]+\b/g, ' ')
+    .replace(/\b[0-9a-f]{16,}\b/g, ' ')
+    .replace(/,/g, '');
+
+  const candidates: number[] = [];
+  const tokenRegex = /([+]?\d+(?:\.\d+)?)\s*(btc|satoshis?|sats?|k|m)?(?![a-z0-9_])/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = tokenRegex.exec(sanitized)) !== null) {
+    const rawNum = match[1];
+    const unit = match[2] || '';
+    const startIdx = match.index;
+    const endIdx = startIdx + match[0].length;
+
+    if (isNonBidContext(sanitized, startIdx, endIdx, rawNum)) {
+      continue;
+    }
+
+    if (unit === 'btc') {
+      if (rawNum.startsWith('+')) continue;
+      const btc = parseFloat(rawNum);
+      if (!isNaN(btc) && btc > 0 && btc < 21000000) {
+        candidates.push(Math.round(btc * 100000000));
+      }
+    } else if (unit === 'sats' || unit === 'sat' || unit === 'satoshi' || unit === 'satoshis') {
+      if (rawNum.startsWith('+') || rawNum.includes('.')) continue;
+      const sats = parseInt(rawNum, 10);
+      if (!isNaN(sats) && sats > 0) {
+        candidates.push(sats);
+      }
+    } else if (unit === 'k') {
+      if (rawNum.startsWith('+')) continue;
+      const num = parseFloat(rawNum);
+      if (!isNaN(num) && num > 0) {
+        candidates.push(Math.round(num * 1000));
+      }
+    } else if (unit === 'm') {
+      if (rawNum.startsWith('+')) continue;
+      const num = parseFloat(rawNum);
+      if (!isNaN(num) && num > 0) {
+        candidates.push(Math.round(num * 1000000));
+      }
+    } else {
+      if (rawNum.startsWith('+') || rawNum.includes('.')) continue;
+      const val = parseInt(rawNum, 10);
+      if (!isNaN(val) && val >= 0) {
+        candidates.push(val);
+      }
+    }
+  }
+
+  const qualifying = candidates.filter(amount => amount >= startingBidSats);
+  if (qualifying.length === 0) {
+    return null;
+  }
+
+  return Math.max(...qualifying);
 }
 
 export default function App() {
@@ -182,6 +306,7 @@ export default function App() {
   const finalizationStartedRef = useRef<boolean>(false);
   const timestampFetchInFlightRef = useRef<boolean>(false);
   const targetBlockNumRef = useRef<number>(DEFAULT_TARGET_BLOCK);
+  const startingBidNumRef = useRef<number>(DEFAULT_STARTING_BID);
   const initialBlockLoadedRef = useRef<boolean>(false);
   const wsConnectedRef = useRef<boolean>(false);
 
@@ -191,6 +316,10 @@ export default function App() {
   useEffect(() => {
     targetBlockNumRef.current = targetBlockNum;
   }, [targetBlockNum]);
+
+  useEffect(() => {
+    startingBidNumRef.current = startingBidNum;
+  }, [startingBidNum]);
 
   // Parse primary + optional secondary anchor relay hints using nostr-tools
   useEffect(() => {
@@ -232,14 +361,16 @@ export default function App() {
     setFinalizedTiedWinners([]);
     setWinnerDisplayedAt(null);
     setAuctionFinalized(false);
-    const alreadyPastClosingBlock = currentBlockHeightRef.current !== null && currentBlockHeightRef.current >= targetBlockNum;
+    setClosingBlockTimestamp(null);
+    const knownHeight = currentBlockHeightRef.current;
+    const alreadyPastClosingBlock = knownHeight !== null && knownHeight >= targetBlockNum;
     setWasLiveBeforeClose(!alreadyPastClosingBlock);
     wasLiveBeforeCloseRef.current = !alreadyPastClosingBlock;
     liveCloseLockedRef.current = false;
     finalizationSnapshotRef.current = null;
     finalizationStartedRef.current = false;
     timestampFetchInFlightRef.current = false;
-    initialBlockLoadedRef.current = currentBlockHeightRef.current !== null;
+    initialBlockLoadedRef.current = knownHeight !== null;
   }, [decodedEventId, anchorEventId, startingBidNum, targetBlockNum]);
 
   const fetchClosingBlockTimestamp = useCallback(async (blockHeight: number): Promise<number | null> => {
@@ -272,7 +403,6 @@ export default function App() {
     setFinalizedWinner(winner);
     setFinalizedTiedWinners(tiedWinners);
     if (winner || tiedWinners.length > 0) {
-      // This is the browser's local display time, not a timestamp certified by Bitcoin or Nostr.
       setWinnerDisplayedAt(new Date().toISOString());
     }
     setAuctionFinalized(true);
@@ -287,8 +417,6 @@ export default function App() {
     setLastSyncedAt(Math.floor(Date.now() / 1000));
     setBlockFetchError(null);
 
-    // Let the initial HTTP tip check decide whether this page arrived after the close.
-    // A block-stream frame can arrive before that request finishes.
     if (!fromInitialLoad && !initialBlockLoadedRef.current) return;
 
     const target = targetBlockNumRef.current;
@@ -314,7 +442,6 @@ export default function App() {
           });
         }
       } else {
-        // Historical page load: retain relay subscriptions so stored events can reach EOSE.
         fetchClosingBlockTimestamp(target).then(timestamp => {
           if (timestamp !== null) setClosingBlockTimestamp(timestamp);
         });
@@ -325,7 +452,6 @@ export default function App() {
     initialBlockLoadedRef.current = true;
   }, [fetchClosingBlockTimestamp, finalizeLiveAuction]);
 
-  // Single initial HTTP fetch on load (and manual refresh / low-frequency fallback)
   const fetchBlockHeight = useCallback(async () => {
     setIsLiveBlockFetching(true);
     const isFirstLoad = !initialBlockLoadedRef.current;
@@ -512,20 +638,23 @@ export default function App() {
   }, [applyObservedBlockHeight, fetchBlockHeight]);
 
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
+  const effectiveCutoffTimestamp = auctionClosed ? closingBlockTimestamp : null;
 
   const sortedBids = [...bids].sort(compareBidsByAmount);
 
   const validBids = sortedBids.filter(b => {
     if (b.amountSats < startingBidNum) return false;
-    if (closingBlockTimestamp !== null && b.createdAt > closingBlockTimestamp) return false;
+    if (effectiveCutoffTimestamp !== null && b.createdAt > effectiveCutoffTimestamp) return false;
     return true;
   });
 
-  const liveResolution = resolveTopBids(bids, startingBidNum, closingBlockTimestamp);
+  const liveResolution = resolveTopBids(bids, startingBidNum, effectiveCutoffTimestamp);
   const displayedWinner = auctionClosed && wasLiveBeforeClose ? finalizedWinner : liveResolution.winner;
   const displayedTiedWinners = auctionClosed && wasLiveBeforeClose ? finalizedTiedWinners : liveResolution.tiedWinners;
   const isTiedAtClose = auctionClosed && displayedTiedWinners.length > 1;
-  const tiedAmountSats = isTiedAtClose ? displayedTiedWinners[0].amountSats : null;
+  const isTiedLive = !auctionClosed && liveResolution.tiedWinners.length > 1;
+  const activeTiedBids = isTiedAtClose ? displayedTiedWinners : isTiedLive ? liveResolution.tiedWinners : [];
+  const tiedAmountSats = activeTiedBids.length > 1 ? activeTiedBids[0].amountSats : null;
 
   const showcaseBid = auctionClosed && wasLiveBeforeClose
     ? (finalizedWinner || (!auctionFinalized ? liveResolution.winner : null))
@@ -536,7 +665,6 @@ export default function App() {
   useEffect(() => {
     if (!decodedEventId || decodedRelays.length === 0) return;
 
-    // A live auction already locked at its target block must never reconnect to relays.
     if (liveCloseLockedRef.current || auctionFinalized) return;
 
     setIsListening(true);
@@ -557,8 +685,8 @@ export default function App() {
     const pendingBatchIds = new Set<string>();
     const seenEventIds = new Set<string>();
     const pendingByParentId = new Map<string, Array<{ ev: any; relayUrl: string }>>();
-    const activeSubRelayMap = new Map<string, string>(); // subId -> relayUrl
-    const relayPendingSubs = new Map<string, Set<string>>(); // relayUrl -> Set<subId>
+    const activeSubRelayMap = new Map<string, string>();
+    const relayPendingSubs = new Map<string, Set<string>>();
 
     let batchTimer: ReturnType<typeof setTimeout> | null = null;
     let watchdogTimer: ReturnType<typeof setInterval> | null = null;
@@ -700,10 +828,8 @@ export default function App() {
       const newlyDiscovered = !discoveredEventIds.has(evId);
       discoveredEventIds.add(evId);
 
-      // Walk both the event's own ID (for child replies) and all its e/E references (for parent/root events)
       scheduleWalkTargets([evId, ...eventRefTags]);
 
-      // Flush any out-of-order children waiting on this event ID
       if (newlyDiscovered && pendingByParentId.has(evId)) {
         const queued = pendingByParentId.get(evId) || [];
         pendingByParentId.delete(evId);
@@ -773,7 +899,6 @@ export default function App() {
               const evId = ev.id.toLowerCase();
               const eventRefTags = extractEventRefTags(ev);
 
-              // Check if event belongs to thread graph (is a root/discovered ID or tags any root/discovered ID)
               const belongsToThread =
                 discoveredEventIds.has(evId) ||
                 eventRefTags.some(refTag => discoveredEventIds.has(refTag));
@@ -781,7 +906,6 @@ export default function App() {
               if (belongsToThread) {
                 acceptThreadEvent(ev, eventRefTags, relayUrl);
               } else if (eventRefTags.length > 0 && !seenEventIds.has(evId)) {
-                // Queue until one of its referenced parent/thread events arrives, and batch-query those parent IDs
                 for (const refTag of eventRefTags) {
                   const list = pendingByParentId.get(refTag) || [];
                   if (!list.some(item => item.ev.id.toLowerCase() === evId)) {
@@ -835,7 +959,6 @@ export default function App() {
       const attempts = (reconnectAttempts.get(relayUrl) || 0) + 1;
       reconnectAttempts.set(relayUrl, attempts);
 
-      // Jittered exponential backoff: 1.5s * 1.5^(n-1) capped at 15s + up to 800ms jitter
       const baseDelay = Math.min(1500 * Math.pow(1.5, Math.min(attempts - 1, 6)), 15000);
       const jitter = Math.random() * 800;
       const timer = setTimeout(() => {
@@ -930,7 +1053,7 @@ export default function App() {
     if (seenSet) seenSet.add(evId);
 
     const content = ev.content;
-    const amount = extractSatsFromText(content);
+    const amount = extractSatsFromText(content, startingBidNumRef.current);
 
     if (amount && amount > 0) {
       const newBid: Bid = {
@@ -949,50 +1072,6 @@ export default function App() {
     }
   };
 
-  const extractSatsFromText = (text: string): number | null => {
-    const cleanText = text.toLowerCase().replace(/,/g, '');
-
-    // 1. Explicit BTC amount (e.g. "0.005 btc", "0.01btc")
-    const btcMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*btc\b/);
-    if (btcMatch) {
-      const btc = parseFloat(btcMatch[1]);
-      if (!isNaN(btc) && btc > 0 && btc < 21000000) {
-        return Math.round(btc * 100000000);
-      }
-    }
-
-    // 2. Explicit sats / sat / satoshis
-    const satsMatch = cleanText.match(/(?:^|[^\w.])(\d+)\s*(?:sats?|satoshis?)\b/);
-    if (satsMatch) {
-      const sats = parseInt(satsMatch[1], 10);
-      if (!isNaN(sats) && sats > 0) return sats;
-    }
-
-    // 3. Explicit "k" thousands shorthand (e.g. "650k", "680k", "1.25k")
-    const kMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*k\b/);
-    if (kMatch) {
-      const num = parseFloat(kMatch[1]);
-      if (!isNaN(num) && num > 0) return Math.round(num * 1000);
-    }
-
-    // 4. Explicit "m" millions shorthand (e.g. "1m", "1.5m")
-    const mMatch = cleanText.match(/(?:^|[^\w.])(\d*\.?\d+)\s*m\b/);
-    if (mMatch) {
-      const num = parseFloat(mMatch[1]);
-      if (!isNaN(num) && num > 0) return Math.round(num * 1000000);
-    }
-
-    // 5. Fallback: standalone integer >= 1,000,000 (avoids small numbers, block heights like 977136, etc.)
-    const largeNumbers = cleanText.match(/\b\d{7,10}\b/g);
-    if (largeNumbers && largeNumbers.length > 0) {
-      const val = parseInt(largeNumbers[0], 10);
-      if (!isNaN(val) && val >= 1000000) return val;
-    }
-
-    return null;
-  };
-
-  // Helper to inject a simulated incoming bid for testing
   const injectSimulatedBid = (sats: number, name: string) => {
     if (liveCloseLockedRef.current || auctionFinalized) return;
     const fakeId = `sim_${Math.random().toString(16).substring(2, 10)}`;
@@ -1011,7 +1090,6 @@ export default function App() {
     setBids(nextBids);
   };
 
-  // Generate shareable URL
   const generateShareUrl = () => {
     const url = new URL(window.location.origin + window.location.pathname);
     url.searchParams.set('nevent', neventInput);
@@ -1300,13 +1378,13 @@ export default function App() {
                     <AlertCircle className="w-3.5 h-3.5" /> Tied Winners at Block #{targetBlockNum.toLocaleString()}
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
-                    Tied Top Bid: {tiedAmountSats.toLocaleString()} sats ({formatBtc(tiedAmountSats)}) — {displayedTiedWinners.length} Tied Winners
+                    Tied Top Bid: {tiedAmountSats.toLocaleString()} sats ({formatBtc(tiedAmountSats)}) — {activeTiedBids.length} Tied Winners
                   </h2>
                   <p className="text-xs text-amber-200/90 mt-1 font-mono">
                     No single winner declared by bid order. Auctioneer sets tiebreak terms outside the nsite.
                   </p>
                   <div className="mt-2.5 space-y-1">
-                    {displayedTiedWinners.map((tiedBid, idx) => (
+                    {activeTiedBids.map((tiedBid, idx) => (
                       <p key={tiedBid.id} className="text-xs sm:text-sm text-slate-300 font-mono break-words">
                         <span className="text-amber-300 font-semibold">Tied Winner #{idx + 1}:</span>{' '}
                         <span className="text-white">{truncatePubkey(tiedBid.pubkey)}</span>{' '}
@@ -1325,7 +1403,7 @@ export default function App() {
                 {wasLiveBeforeClose && (
                   <button
                     type="button"
-                    onClick={() => copyWinnerAnnouncement(null, displayedTiedWinners)}
+                    onClick={() => copyWinnerAnnouncement(null, activeTiedBids)}
                     className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
                   >
                     {copiedAnnouncement ? (
@@ -1560,17 +1638,19 @@ export default function App() {
             </div>
           </div>
 
-          {isTiedAtClose && tiedAmountSats !== null ? (
+          {(isTiedAtClose || isTiedLive) && tiedAmountSats !== null ? (
             <div className="bg-amber-950/30 border border-amber-500/30 rounded-xl p-5 space-y-3">
               <div className="text-2xl sm:text-3xl font-bold font-mono text-amber-300 tabular-nums tracking-tight">
                 {tiedAmountSats.toLocaleString()} <span className="text-base font-normal text-slate-300">sats</span>
-                <span className="text-xs font-normal text-amber-200 ml-3">TIED ({displayedTiedWinners.length} bids)</span>
+                <span className="text-xs font-normal text-amber-200 ml-3">TIED ({activeTiedBids.length} bids)</span>
               </div>
               <p className="text-xs sm:text-sm text-amber-100/90 font-mono">
-                Tied winners marked at block #{targetBlockNum.toLocaleString()}. Set tiebreaking terms outside the nsite.
+                {isTiedAtClose
+                  ? `Tied winners marked at block #${targetBlockNum.toLocaleString()}. Set tiebreaking terms outside the nsite.`
+                  : `Live tie at ${tiedAmountSats.toLocaleString()} sats before block #${targetBlockNum.toLocaleString()}.`}
               </p>
               <div className="space-y-1.5 pt-1">
-                {displayedTiedWinners.map((tiedBid, idx) => (
+                {activeTiedBids.map((tiedBid, idx) => (
                   <div key={tiedBid.id} className="text-xs font-mono text-slate-300 flex flex-wrap items-center justify-between gap-2 bg-slate-950/50 px-3 py-2 rounded-lg border border-slate-800/80">
                     <span>
                       <strong className="text-amber-300">#{idx + 1} Tied:</strong> {truncatePubkey(tiedBid.pubkey)} · {tiedBid.content}
@@ -1653,10 +1733,10 @@ export default function App() {
             {sortedBids.length > 0 ? (
               <div className="space-y-3 md:max-h-[500px] md:overflow-y-auto md:pr-2">
                 {sortedBids.map((bid) => {
-                  const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
+                  const isAfterCutoff = effectiveCutoffTimestamp !== null && bid.createdAt > effectiveCutoffTimestamp;
                   const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
-                  const isTiedWinnerBid = isTiedAtClose && displayedTiedWinners.some(tb => tb.id === bid.id);
-                  const isHighest = !isTiedAtClose && displayedWinner && displayedWinner.id === bid.id;
+                  const isTiedWinnerBid = (isTiedAtClose || isTiedLive) && activeTiedBids.some(tb => tb.id === bid.id);
+                  const isHighest = !(isTiedAtClose || isTiedLive) && displayedWinner && displayedWinner.id === bid.id;
                   return (
                     <div 
                       key={bid.id}
@@ -1679,7 +1759,7 @@ export default function App() {
                         <div className="flex flex-wrap items-center gap-2 shrink-0">
                           {isTiedWinnerBid && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-300 text-slate-950 uppercase tracking-wider">
-                              Tied Winner
+                              {isTiedAtClose ? 'Tied Winner' : 'Tied'}
                             </span>
                           )}
                           {isHighest && (
