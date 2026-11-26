@@ -87,10 +87,36 @@ function parseNonNegativeInt(raw: string, fallback: number): number {
   return parsed;
 }
 
-function compareBidsDeterministic(a: Bid, b: Bid): number {
+function compareBidsByAmount(a: Bid, b: Bid): number {
   if (b.amountSats !== a.amountSats) return b.amountSats - a.amountSats;
-  if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
   return a.id.localeCompare(b.id);
+}
+
+function resolveTopBids(
+  candidates: Bid[],
+  startingBidSats: number,
+  maxCreatedAt?: number | null
+): { winner: Bid | null; tiedWinners: Bid[]; topAmountSats: number | null } {
+  const qualifying = candidates.filter(b => {
+    if (b.amountSats < startingBidSats) return false;
+    if (typeof maxCreatedAt === 'number' && b.createdAt > maxCreatedAt) return false;
+    return true;
+  });
+
+  if (qualifying.length === 0) {
+    return { winner: null, tiedWinners: [], topAmountSats: null };
+  }
+
+  const maxAmount = Math.max(...qualifying.map(b => b.amountSats));
+  const atMax = qualifying
+    .filter(b => b.amountSats === maxAmount)
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  if (atMax.length > 1) {
+    return { winner: null, tiedWinners: atMax, topAmountSats: maxAmount };
+  }
+
+  return { winner: atMax[0], tiedWinners: [], topAmountSats: maxAmount };
 }
 
 export default function App() {
@@ -142,6 +168,7 @@ export default function App() {
   const [copiedAnnouncement, setCopiedAnnouncement] = useState<boolean>(false);
   const [showTesterModal, setShowTesterModal] = useState<boolean>(false);
   const [finalizedWinner, setFinalizedWinner] = useState<Bid | null>(null);
+  const [finalizedTiedWinners, setFinalizedTiedWinners] = useState<Bid[]>([]);
   const [winnerDisplayedAt, setWinnerDisplayedAt] = useState<string | null>(null);
   const [auctionFinalized, setAuctionFinalized] = useState<boolean>(false);
 
@@ -202,6 +229,7 @@ export default function App() {
   // Reset auction-finalization state when the auction parameters change.
   useEffect(() => {
     setFinalizedWinner(null);
+    setFinalizedTiedWinners([]);
     setWinnerDisplayedAt(null);
     setAuctionFinalized(false);
     const alreadyPastClosingBlock = currentBlockHeightRef.current !== null && currentBlockHeightRef.current >= targetBlockNum;
@@ -239,12 +267,11 @@ export default function App() {
     setClosingBlockTimestamp(blockTimestamp);
 
     const snapshot = finalizationSnapshotRef.current || bidsRef.current;
-    const winner = [...snapshot]
-      .filter(b => b.amountSats >= startingBidNum && b.createdAt <= blockTimestamp)
-      .sort(compareBidsDeterministic)[0] || null;
+    const { winner, tiedWinners } = resolveTopBids(snapshot, startingBidNum, blockTimestamp);
 
     setFinalizedWinner(winner);
-    if (winner) {
+    setFinalizedTiedWinners(tiedWinners);
+    if (winner || tiedWinners.length > 0) {
       // This is the browser's local display time, not a timestamp certified by Bitcoin or Nostr.
       setWinnerDisplayedAt(new Date().toISOString());
     }
@@ -486,9 +513,7 @@ export default function App() {
 
   const auctionClosed = currentBlockHeight !== null && currentBlockHeight >= targetBlockNum;
 
-  // Deterministic bid classification & winner calculation. A live auction uses its
-  // immutable finalized winner after the closing block has been witnessed.
-  const sortedBids = [...bids].sort(compareBidsDeterministic);
+  const sortedBids = [...bids].sort(compareBidsByAmount);
 
   const validBids = sortedBids.filter(b => {
     if (b.amountSats < startingBidNum) return false;
@@ -496,11 +521,15 @@ export default function App() {
     return true;
   });
 
-  const highestBid = validBids.length > 0 ? validBids[0] : null;
-  const displayedWinner = auctionClosed && wasLiveBeforeClose ? finalizedWinner : highestBid;
+  const liveResolution = resolveTopBids(bids, startingBidNum, closingBlockTimestamp);
+  const displayedWinner = auctionClosed && wasLiveBeforeClose ? finalizedWinner : liveResolution.winner;
+  const displayedTiedWinners = auctionClosed && wasLiveBeforeClose ? finalizedTiedWinners : liveResolution.tiedWinners;
+  const isTiedAtClose = auctionClosed && displayedTiedWinners.length > 1;
+  const tiedAmountSats = isTiedAtClose ? displayedTiedWinners[0].amountSats : null;
+
   const showcaseBid = auctionClosed && wasLiveBeforeClose
-    ? (finalizedWinner || (!auctionFinalized ? highestBid : null))
-    : highestBid;
+    ? (finalizedWinner || (!auctionFinalized ? liveResolution.winner : null))
+    : liveResolution.winner;
   const connectedRelays = relaysStatus.filter(r => r.connected);
 
   // Connect to Relays WebSocket with jittered backoff, watchdog, tab wake-up, and batched ID walking
@@ -914,7 +943,7 @@ export default function App() {
       };
 
       if (bidsRef.current.some(b => b.id === newBid.id)) return;
-      const nextBids = [...bidsRef.current, newBid].sort(compareBidsDeterministic);
+      const nextBids = [...bidsRef.current, newBid].sort(compareBidsByAmount);
       bidsRef.current = nextBids;
       setBids(nextBids);
     }
@@ -977,7 +1006,7 @@ export default function App() {
       relayUrl: decodedRelays[0] || 'wss://relay.damus.io'
     };
 
-    const nextBids = [...bidsRef.current, simulatedBid].sort(compareBidsDeterministic);
+    const nextBids = [...bidsRef.current, simulatedBid].sort(compareBidsByAmount);
     bidsRef.current = nextBids;
     setBids(nextBids);
   };
@@ -1004,7 +1033,40 @@ export default function App() {
     return (sats / 100000000).toFixed(8) + " BTC";
   };
 
-  const buildWinnerAnnouncementText = useCallback((winner: Bid): string => {
+  const formatBidNpub = (pubkey: string): string => {
+    if (pubkey.startsWith('npub1')) return pubkey;
+    if (/^[0-9a-fA-F]{64}$/.test(pubkey)) {
+      try {
+        return nip19.npubEncode(pubkey.toLowerCase());
+      } catch {
+        return pubkey;
+      }
+    }
+    return pubkey;
+  };
+
+  const buildWinnerAnnouncementText = useCallback((winner: Bid | null, tied: Bid[]): string => {
+    if (tied.length > 1) {
+      const tieSats = tied[0].amountSats;
+      const lines = [
+        `Auction closed at Bitcoin block #${targetBlockNum.toLocaleString()} in a TIE!`,
+        `Tied top bid: ${tieSats.toLocaleString()} sats (${formatBtc(tieSats)})`,
+        `Tied winners (${tied.length}):`,
+        ...tied.map((b, idx) => `${idx + 1}. nostr:${formatBidNpub(b.pubkey)} (bid: nostr:${b.id})`),
+        `Tiebreaking terms will be set by the auctioneer outside the nsite.`,
+      ];
+
+      if (winnerDisplayedAt) {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        lines.push(`Outcome displayed: ${new Date(winnerDisplayedAt).toLocaleString()} (${tz})`);
+      }
+
+      lines.push('Live-Witnessed on https://nostrauction.shakespeare.wtf');
+      return lines.join('\n');
+    }
+
+    if (!winner) return '';
+
     let winnerNpub = winner.pubkey;
     let hexPubkey = '';
 
@@ -1053,8 +1115,9 @@ export default function App() {
     return lines.join('\n');
   }, [decodedRelays, targetBlockNum, winnerDisplayedAt]);
 
-  const copyWinnerAnnouncement = useCallback(async (winner: Bid) => {
-    const text = buildWinnerAnnouncementText(winner);
+  const copyWinnerAnnouncement = useCallback(async (winner: Bid | null, tied: Bid[]) => {
+    const text = buildWinnerAnnouncementText(winner, tied);
+    if (!text) return;
     try {
       if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
         await navigator.clipboard.writeText(text);
@@ -1223,8 +1286,66 @@ export default function App() {
           </div>
         )}
 
-        {/* Winner / Auction Closed Notification Banner */}
-        {auctionClosed && displayedWinner && (
+        {/* Tied Winners Notification Banner */}
+        {isTiedAtClose && tiedAmountSats !== null && (
+          <div className="rounded-2xl bg-gradient-to-r from-amber-950/80 via-slate-900 to-orange-950/50 border border-amber-500/50 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
+            <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
+            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
+              <div className="flex items-start gap-4 min-w-0">
+                <div className="w-12 h-12 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 shrink-0">
+                  <Award className="w-6 h-6" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-amber-300 font-mono uppercase tracking-wider mb-1">
+                    <AlertCircle className="w-3.5 h-3.5" /> Tied Winners at Block #{targetBlockNum.toLocaleString()}
+                  </div>
+                  <h2 className="text-xl font-bold text-white tracking-tight">
+                    Tied Top Bid: {tiedAmountSats.toLocaleString()} sats ({formatBtc(tiedAmountSats)}) — {displayedTiedWinners.length} Tied Winners
+                  </h2>
+                  <p className="text-xs text-amber-200/90 mt-1 font-mono">
+                    No single winner declared by bid order. Auctioneer sets tiebreak terms outside the nsite.
+                  </p>
+                  <div className="mt-2.5 space-y-1">
+                    {displayedTiedWinners.map((tiedBid, idx) => (
+                      <p key={tiedBid.id} className="text-xs sm:text-sm text-slate-300 font-mono break-words">
+                        <span className="text-amber-300 font-semibold">Tied Winner #{idx + 1}:</span>{' '}
+                        <span className="text-white">{truncatePubkey(tiedBid.pubkey)}</span>{' '}
+                        · Note <span className="text-slate-400">{tiedBid.id.substring(0, 16)}...</span>
+                      </p>
+                    ))}
+                  </div>
+                  {wasLiveBeforeClose && winnerDisplayedAt && (
+                    <p className="text-[11px] text-slate-400 font-mono mt-1.5 break-words">
+                      Outcome displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                    </p>
+                  )}
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                {wasLiveBeforeClose && (
+                  <button
+                    type="button"
+                    onClick={() => copyWinnerAnnouncement(null, displayedTiedWinners)}
+                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
+                  >
+                    {copiedAnnouncement ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" /> Copied Tie Notice!
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" /> Copy Tie Notice
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Single Winner / Auction Closed Notification Banner */}
+        {auctionClosed && !isTiedAtClose && displayedWinner && (
           <div className="rounded-2xl bg-gradient-to-r from-emerald-950/80 via-slate-900 to-amber-950/50 border border-emerald-500/40 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
             <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
@@ -1253,7 +1374,7 @@ export default function App() {
                 {wasLiveBeforeClose && (
                   <button
                     type="button"
-                    onClick={() => copyWinnerAnnouncement(displayedWinner)}
+                    onClick={() => copyWinnerAnnouncement(displayedWinner, [])}
                     className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
                   >
                     {copiedAnnouncement ? (
@@ -1268,7 +1389,7 @@ export default function App() {
                   </button>
                 )}
                 <a 
-                  href={`https://njump.me/${displayedWinner.id}`} 
+                  href={`https://njump.me/${encodeURIComponent(displayedWinner.id)}`} 
                   target="_blank" 
                   rel="noopener noreferrer"
                   className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-xl transition-colors shadow-lg shadow-emerald-600/20 whitespace-nowrap"
@@ -1439,7 +1560,34 @@ export default function App() {
             </div>
           </div>
 
-          {showcaseBid ? (
+          {isTiedAtClose && tiedAmountSats !== null ? (
+            <div className="bg-amber-950/30 border border-amber-500/30 rounded-xl p-5 space-y-3">
+              <div className="text-2xl sm:text-3xl font-bold font-mono text-amber-300 tabular-nums tracking-tight">
+                {tiedAmountSats.toLocaleString()} <span className="text-base font-normal text-slate-300">sats</span>
+                <span className="text-xs font-normal text-amber-200 ml-3">TIED ({displayedTiedWinners.length} bids)</span>
+              </div>
+              <p className="text-xs sm:text-sm text-amber-100/90 font-mono">
+                Tied winners marked at block #{targetBlockNum.toLocaleString()}. Set tiebreaking terms outside the nsite.
+              </p>
+              <div className="space-y-1.5 pt-1">
+                {displayedTiedWinners.map((tiedBid, idx) => (
+                  <div key={tiedBid.id} className="text-xs font-mono text-slate-300 flex flex-wrap items-center justify-between gap-2 bg-slate-950/50 px-3 py-2 rounded-lg border border-slate-800/80">
+                    <span>
+                      <strong className="text-amber-300">#{idx + 1} Tied:</strong> {truncatePubkey(tiedBid.pubkey)} · {tiedBid.content}
+                    </span>
+                    <a
+                      href={`https://njump.me/${encodeURIComponent(tiedBid.id)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-amber-400 hover:text-amber-300 flex items-center gap-1 shrink-0"
+                    >
+                      Inspect Note <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : showcaseBid ? (
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
               <div className="space-y-3 flex-1">
                 <div className="text-3xl sm:text-4xl font-bold font-mono text-amber-400 tabular-nums tracking-tight">
@@ -1460,7 +1608,7 @@ export default function App() {
 
               <div className="shrink-0">
                 <a
-                  href={`https://njump.me/${(showcaseBid as Bid).id}`}
+                  href={`https://njump.me/${encodeURIComponent((showcaseBid as Bid).id)}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="px-4 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700 flex items-center gap-1.5"
@@ -1507,16 +1655,19 @@ export default function App() {
                 {sortedBids.map((bid) => {
                   const isAfterCutoff = closingBlockTimestamp !== null && bid.createdAt > closingBlockTimestamp;
                   const isValid = bid.amountSats >= startingBidNum && !isAfterCutoff;
-                  const isHighest = displayedWinner && displayedWinner.id === bid.id;
+                  const isTiedWinnerBid = isTiedAtClose && displayedTiedWinners.some(tb => tb.id === bid.id);
+                  const isHighest = !isTiedAtClose && displayedWinner && displayedWinner.id === bid.id;
                   return (
                     <div 
                       key={bid.id}
                       className={`p-4 rounded-xl border transition-all ${
-                        isHighest 
-                          ? 'bg-amber-500/10 border-amber-500/40 shadow-lg shadow-amber-500/5' 
-                          : isValid 
-                            ? 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700' 
-                            : 'bg-slate-950/30 border-slate-900 opacity-60'
+                        isTiedWinnerBid
+                          ? 'bg-amber-500/15 border-amber-400/50 shadow-lg shadow-amber-500/10'
+                          : isHighest 
+                            ? 'bg-amber-500/10 border-amber-500/40 shadow-lg shadow-amber-500/5' 
+                            : isValid 
+                              ? 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700' 
+                              : 'bg-slate-950/30 border-slate-900 opacity-60'
                       }`}
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
@@ -1526,6 +1677,11 @@ export default function App() {
                           <span className="font-mono text-xs text-slate-400">{new Date(bid.createdAt * 1000).toLocaleTimeString()}</span>
                         </div>
                         <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {isTiedWinnerBid && (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-300 text-slate-950 uppercase tracking-wider">
+                              Tied Winner
+                            </span>
+                          )}
                           {isHighest && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-400 text-slate-950 uppercase tracking-wider">
                               Highest
@@ -1546,7 +1702,7 @@ export default function App() {
                       </p>
                       <div className="flex flex-wrap items-center justify-between gap-2 mt-3 pt-2 border-t border-slate-800/50 text-[11px] font-mono text-slate-400">
                         <span className="break-all">Relay: {bid.relayUrl.replace('wss://', '')}</span>
-                        <a href={`https://njump.me/${bid.id}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1 shrink-0">
+                        <a href={`https://njump.me/${encodeURIComponent(bid.id)}`} target="_blank" rel="noopener noreferrer" className="hover:text-amber-400 transition-colors flex items-center gap-1 shrink-0">
                           Note ID: {bid.id.substring(0, 8)}... <ExternalLink className="w-3 h-3" />
                         </a>
                       </div>
