@@ -46,6 +46,15 @@ const DEFAULT_RELAYS = [
   "wss://poster.place/relay",
 ];
 
+function isTabForegroundFocused(): boolean {
+  if (typeof document === 'undefined') return true;
+  if (document.visibilityState !== 'visible') return false;
+  if (typeof document.hasFocus === 'function') {
+    return document.hasFocus();
+  }
+  return true;
+}
+
 function extractEventRefTags(ev: any): string[] {
   const refs: string[] = [];
   if (ev && Array.isArray(ev.tags)) {
@@ -279,6 +288,7 @@ export default function App() {
   // Live Bitcoin Block Height & Closing Block Timestamp
   const [currentBlockHeight, setCurrentBlockHeight] = useState<number | null>(null);
   const [closingBlockTimestamp, setClosingBlockTimestamp] = useState<number | null>(null);
+  const [liveWitnessedAt, setLiveWitnessedAt] = useState<string | null>(null);
   const [wasLiveBeforeClose, setWasLiveBeforeClose] = useState<boolean>(true);
   const [wsBlockConnected, setWsBlockConnected] = useState<boolean>(false);
   const [isLiveBlockFetching, setIsLiveBlockFetching] = useState<boolean>(true);
@@ -366,6 +376,7 @@ export default function App() {
   const wasLiveBeforeCloseRef = useRef<boolean>(true);
   const currentBlockHeightRef = useRef<number | null>(null);
   const liveCloseLockedRef = useRef<boolean>(false);
+  const liveWitnessedAtRef = useRef<string | null>(null);
   const finalizationSnapshotRef = useRef<Bid[] | null>(null);
   const finalizationStartedRef = useRef<boolean>(false);
   const timestampFetchInFlightRef = useRef<boolean>(false);
@@ -424,6 +435,8 @@ export default function App() {
     setFinalizedWinner(null);
     setFinalizedTiedWinners([]);
     setWinnerDisplayedAt(null);
+    setLiveWitnessedAt(null);
+    liveWitnessedAtRef.current = null;
     setAuctionFinalized(false);
     setClosingBlockTimestamp(null);
     lastFinalizedSoundRef.current = false;
@@ -438,13 +451,14 @@ export default function App() {
     initialBlockLoadedRef.current = knownHeight !== null;
   }, [decodedEventId, anchorEventId, startingBidNum, targetBlockNum]);
 
+  // Resolves block hash -> block object -> exact Unix timestamp (seconds) from mempool.space.
   const fetchClosingBlockTimestamp = useCallback(async (blockHeight: number): Promise<number | null> => {
     try {
       const hashRes = await fetch(`https://mempool.space/api/block-height/${blockHeight}`, { cache: 'no-store' });
       if (!hashRes.ok) return null;
       const blockHash = (await hashRes.text()).trim();
       if (!blockHash) return null;
-      const blockRes = await fetch(`https://mempool.space/api/block/${blockHash}`, { cache: 'no-store' });
+      const blockRes = await fetch(`https://mempool.space/api/block/${encodeURIComponent(blockHash)}`, { cache: 'no-store' });
       if (!blockRes.ok) return null;
       const blockData = await blockRes.json();
       if (typeof blockData.timestamp === 'number') return blockData.timestamp;
@@ -455,12 +469,12 @@ export default function App() {
     }
   }, []);
 
-  // The first target-height observation freezes the bids already received by this browser.
-  // Later relay events are ignored, even if their Nostr created_at value is backdated.
-  const finalizeLiveAuction = useCallback((blockTimestamp: number) => {
+  // Generates and displays the winner/tie banner ONLY after the exact block Unix timestamp is obtained.
+  const finalizeLiveAuction = useCallback((blockTimestamp: number, witnessIso: string) => {
     if (finalizationStartedRef.current || !wasLiveBeforeCloseRef.current) return;
     finalizationStartedRef.current = true;
     setClosingBlockTimestamp(blockTimestamp);
+    setLiveWitnessedAt(witnessIso);
 
     const snapshot = finalizationSnapshotRef.current || bidsRef.current;
     const { winner, tiedWinners } = resolveTopBids(snapshot, startingBidNum, blockTimestamp);
@@ -472,50 +486,89 @@ export default function App() {
     }
     setAuctionFinalized(true);
     setShowTesterModal(false);
-    stopRelayConnectionsRef.current?.();
   }, [startingBidNum]);
 
-  const applyObservedBlockHeight = useCallback((height: number, fromInitialLoad: boolean, observedBlockTimestamp?: number) => {
-    if (isNaN(height) || height <= 0) return;
-    currentBlockHeightRef.current = currentBlockHeightRef.current === null ? height : Math.max(currentBlockHeightRef.current, height);
-    setCurrentBlockHeight(prev => (prev === null || height > prev ? height : prev));
-    setLastSyncedAt(Math.floor(Date.now() / 1000));
-    setBlockFetchError(null);
+  const applyObservedBlockHeight = useCallback(
+    (
+      height: number,
+      fromInitialLoad: boolean,
+      observedBlockTimestamp?: number,
+      fromMempoolWs: boolean = false
+    ) => {
+      if (isNaN(height) || height <= 0) return;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const arrivalIso = new Date().toISOString();
+      const foregroundFocused = isTabForegroundFocused();
 
-    if (!fromInitialLoad && !initialBlockLoadedRef.current) return;
-
-    const target = targetBlockNumRef.current;
-    if (height >= target) {
-      if (fromInitialLoad) {
-        setWasLiveBeforeClose(false);
-        wasLiveBeforeCloseRef.current = false;
-      } else if (wasLiveBeforeCloseRef.current && !liveCloseLockedRef.current) {
-        liveCloseLockedRef.current = true;
-        finalizationSnapshotRef.current = [...bidsRef.current];
+      // REST tracker updates height/sync state only; live-witness lockdown is strictly WS-driven.
+      if (!fromMempoolWs) {
+        currentBlockHeightRef.current =
+          currentBlockHeightRef.current === null ? height : Math.max(currentBlockHeightRef.current, height);
+        setCurrentBlockHeight(prev => (prev === null || height > prev ? height : prev));
+        setLastSyncedAt(nowSec);
+        setBlockFetchError(null);
+        if (fromInitialLoad) {
+          initialBlockLoadedRef.current = true;
+          if (height >= targetBlockNumRef.current) {
+            setWasLiveBeforeClose(false);
+            wasLiveBeforeCloseRef.current = false;
+            fetchClosingBlockTimestamp(targetBlockNumRef.current).then(timestamp => {
+              if (timestamp !== null) setClosingBlockTimestamp(timestamp);
+            });
+          }
+        }
+        return;
       }
 
-      if (wasLiveBeforeCloseRef.current && liveCloseLockedRef.current) {
-        if (typeof observedBlockTimestamp === 'number') {
-          finalizeLiveAuction(observedBlockTimestamp);
-        } else if (!finalizationStartedRef.current && !timestampFetchInFlightRef.current) {
-          timestampFetchInFlightRef.current = true;
+      currentBlockHeightRef.current =
+        currentBlockHeightRef.current === null ? height : Math.max(currentBlockHeightRef.current, height);
+      setCurrentBlockHeight(prev => (prev === null || height > prev ? height : prev));
+      setLastSyncedAt(nowSec);
+      setBlockFetchError(null);
+
+      if (!fromInitialLoad && !initialBlockLoadedRef.current) return;
+
+      const target = targetBlockNumRef.current;
+      if (height >= target) {
+        if (!foregroundFocused) {
+          setWasLiveBeforeClose(false);
+          wasLiveBeforeCloseRef.current = false;
           fetchClosingBlockTimestamp(target).then(timestamp => {
-            timestampFetchInFlightRef.current = false;
-            if (timestamp !== null) {
-              finalizeLiveAuction(timestamp);
-            }
+            if (timestamp !== null) setClosingBlockTimestamp(timestamp);
           });
+        } else {
+          // Foreground tab received the target block over Mempool WS: lock immediately.
+          if (wasLiveBeforeCloseRef.current && !liveCloseLockedRef.current) {
+            liveCloseLockedRef.current = true;
+            finalizationSnapshotRef.current = [...bidsRef.current];
+            liveWitnessedAtRef.current = arrivalIso;
+            setLiveWitnessedAt(arrivalIso);
+            stopRelayConnectionsRef.current?.();
+          }
+
+          if (wasLiveBeforeCloseRef.current && liveCloseLockedRef.current && !finalizationStartedRef.current) {
+            const witnessStamp = liveWitnessedAtRef.current || arrivalIso;
+            if (typeof observedBlockTimestamp === 'number') {
+              finalizeLiveAuction(observedBlockTimestamp, witnessStamp);
+            } else if (!timestampFetchInFlightRef.current) {
+              timestampFetchInFlightRef.current = true;
+              fetchClosingBlockTimestamp(target).then(timestamp => {
+                timestampFetchInFlightRef.current = false;
+                if (timestamp !== null) {
+                  finalizeLiveAuction(timestamp, witnessStamp);
+                }
+              });
+            }
+          }
         }
       } else {
-        fetchClosingBlockTimestamp(target).then(timestamp => {
-          if (timestamp !== null) setClosingBlockTimestamp(timestamp);
-        });
+        setClosingBlockTimestamp(null);
       }
-    } else {
-      setClosingBlockTimestamp(null);
-    }
-    initialBlockLoadedRef.current = true;
-  }, [fetchClosingBlockTimestamp, finalizeLiveAuction]);
+
+      initialBlockLoadedRef.current = true;
+    },
+    [fetchClosingBlockTimestamp, finalizeLiveAuction]
+  );
 
   const fetchBlockHeight = useCallback(async () => {
     setIsLiveBlockFetching(true);
@@ -526,7 +579,7 @@ export default function App() {
       const heightText = await res.text();
       const height = parseInt(heightText.trim(), 10);
       if (!isNaN(height) && height > 0) {
-        applyObservedBlockHeight(height, isFirstLoad);
+        applyObservedBlockHeight(height, isFirstLoad, undefined, false);
       }
     } catch (err) {
       console.warn("Mempool API fetch error:", err);
@@ -604,11 +657,11 @@ export default function App() {
           try {
             const msg = JSON.parse(event.data);
             if (typeof msg?.block?.height === 'number') {
-              applyObservedBlockHeight(msg.block.height, false, msg.block.timestamp);
+              applyObservedBlockHeight(msg.block.height, false, msg.block.timestamp, true);
             } else if (typeof msg?.blocks?.height === 'number') {
-              applyObservedBlockHeight(msg.blocks.height, false);
+              applyObservedBlockHeight(msg.blocks.height, false, msg.blocks.timestamp, true);
             } else if (Array.isArray(msg?.blocks) && msg.blocks.length > 0 && typeof msg.blocks[0]?.height === 'number') {
-              applyObservedBlockHeight(msg.blocks[0].height, false);
+              applyObservedBlockHeight(msg.blocks[0].height, false, msg.blocks[0].timestamp, true);
             } else if (typeof msg?.['mempool-blocks'] !== 'undefined') {
               setLastSyncedAt(Math.floor(Date.now() / 1000));
             }
@@ -1189,18 +1242,28 @@ export default function App() {
   };
 
   const buildWinnerAnnouncementText = useCallback((winner: Bid | null, tied: Bid[]): string => {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const blockStampLine =
+      closingBlockTimestamp !== null
+        ? `Block ${targetBlockNum.toLocaleString()} timestamp: ${closingBlockTimestamp} (${new Date(closingBlockTimestamp * 1000).toLocaleString()} ${tz})`
+        : null;
+    const witnessLine = liveWitnessedAt
+      ? `Live-witnessed WS arrival: ${new Date(liveWitnessedAt).toLocaleString()} (${tz})`
+      : null;
+
     if (tied.length > 1) {
       const tieSats = tied[0].amountSats;
       const lines = [
-        `Auction closed at Bitcoin block #${targetBlockNum.toLocaleString()} in a TIE!`,
+        `Auction closed at Bitcoin block ${targetBlockNum.toLocaleString()} in a TIE!`,
         `Tied top bid: ${tieSats.toLocaleString()} sats (${formatBtc(tieSats)})`,
         `Tied winners (${tied.length}):`,
         ...tied.map((b, idx) => `${idx + 1}. nostr:${formatBidNpub(b.pubkey)} (bid: nostr:${b.id})`),
         `Tiebreaking terms will be set by the auctioneer outside the nsite.`,
       ];
 
+      if (blockStampLine) lines.push(blockStampLine);
+      if (witnessLine) lines.push(witnessLine);
       if (winnerDisplayedAt) {
-        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
         lines.push(`Outcome displayed: ${new Date(winnerDisplayedAt).toLocaleString()} (${tz})`);
       }
 
@@ -1243,20 +1306,21 @@ export default function App() {
     }
 
     const lines = [
-      `Auction closed at Bitcoin block #${targetBlockNum.toLocaleString()}!`,
+      `Auction closed at Bitcoin block ${targetBlockNum.toLocaleString()}!`,
       `Winning bid: ${winner.amountSats.toLocaleString()} sats (${formatBtc(winner.amountSats)})`,
       `Winner: nostr:${winnerNpub}`,
       `Winning bid: nostr:${winnerNeventRef}`,
     ];
 
+    if (blockStampLine) lines.push(blockStampLine);
+    if (witnessLine) lines.push(witnessLine);
     if (winnerDisplayedAt) {
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       lines.push(`Winner displayed: ${new Date(winnerDisplayedAt).toLocaleString()} (${tz})`);
     }
 
     lines.push('Live-Witnessed on https://nostrauction.shakespeare.wtf');
     return lines.join('\n');
-  }, [decodedRelays, targetBlockNum, winnerDisplayedAt]);
+  }, [closingBlockTimestamp, decodedRelays, liveWitnessedAt, targetBlockNum, winnerDisplayedAt]);
 
   const copyWinnerAnnouncement = useCallback(async (winner: Bid | null, tied: Bid[]) => {
     const text = buildWinnerAnnouncementText(winner, tied);
@@ -1294,6 +1358,8 @@ export default function App() {
       return pubkey.substring(0, 8) + '...' + pubkey.substring(pubkey.length - 4);
     }
   };
+
+  const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   return (
     <div className="min-h-screen overflow-x-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
@@ -1434,21 +1500,21 @@ export default function App() {
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 flex flex-col gap-8">
 
-        {/* Warning when page was not live before closing block was mined */}
+        {/* Warning when page was not live-witnessed in a foreground-focused tab prior to closing block */}
         {auctionClosed && !wasLiveBeforeClose && (
           <div className="rounded-xl bg-amber-950/50 border border-amber-500/40 p-4 flex items-start gap-3 text-xs font-mono text-amber-200">
             <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
             <div>
               <span className="font-bold uppercase tracking-wider text-amber-300 block mb-0.5">
-                Not Live-Witnessed Prior to Block #{targetBlockNum.toLocaleString()}
+                Not Live-Witnessed Prior to Block {targetBlockNum.toLocaleString()}
               </span>
-              The closing block was already mined before this page loaded and reached the End of Stored Events (EOSE). Historical bid arrival times were not live-witnessed in real time — auctioneer judgment is advised.
+              The closing block was already mined before this page loaded or the tab was not foreground-focused when the block arrived. Historical bid arrival times were not live-witnessed in real time — auctioneer judgment is advised.
             </div>
           </div>
         )}
 
-        {/* Tied Winners Notification Banner */}
-        {isTiedAtClose && tiedAmountSats !== null && (
+        {/* Tied Winners Notification Banner (only after exact block Unix timestamp is resolved) */}
+        {auctionClosed && wasLiveBeforeClose && auctionFinalized && isTiedAtClose && tiedAmountSats !== null && (
           <div className="rounded-2xl bg-gradient-to-r from-amber-950/80 via-slate-900 to-orange-950/50 border border-amber-500/50 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
             <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
@@ -1458,7 +1524,7 @@ export default function App() {
                 </div>
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 text-xs font-semibold text-amber-300 font-mono uppercase tracking-wider mb-1">
-                    <AlertCircle className="w-3.5 h-3.5" /> Tied Winners at Block #{targetBlockNum.toLocaleString()}
+                    <AlertCircle className="w-3.5 h-3.5" /> Tied Winners at Block {targetBlockNum.toLocaleString()}
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
                     Tied Top Bid: {tiedAmountSats.toLocaleString()} sats ({formatBtc(tiedAmountSats)}) — {activeTiedBids.length} Tied Winners
@@ -1475,38 +1541,41 @@ export default function App() {
                       </p>
                     ))}
                   </div>
-                  {wasLiveBeforeClose && winnerDisplayedAt && (
-                    <p className="text-[11px] text-slate-400 font-mono mt-1.5 break-words">
-                      Outcome displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                  {closingBlockTimestamp !== null && (
+                    <p className="text-[11px] text-amber-200/90 font-mono mt-1.5 break-words">
+                      Block {targetBlockNum.toLocaleString()} timestamp: {closingBlockTimestamp} ({new Date(closingBlockTimestamp * 1000).toLocaleString()} {localTz})
+                    </p>
+                  )}
+                  {liveWitnessedAt && (
+                    <p className="text-[11px] text-slate-400 font-mono mt-0.5 break-words">
+                      Live-witnessed WS arrival: {new Date(liveWitnessedAt).toLocaleString()} ({localTz})
                     </p>
                   )}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-3 shrink-0">
-                {wasLiveBeforeClose && (
-                  <button
-                    type="button"
-                    onClick={() => copyWinnerAnnouncement(null, activeTiedBids)}
-                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
-                  >
-                    {copiedAnnouncement ? (
-                      <>
-                        <Check className="w-3.5 h-3.5" /> Copied Tie Notice!
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5" /> Copy Tie Notice
-                      </>
-                    )}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => copyWinnerAnnouncement(null, activeTiedBids)}
+                  className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
+                >
+                  {copiedAnnouncement ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" /> Copied Tie Notice!
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" /> Copy Tie Notice
+                    </>
+                  )}
+                </button>
               </div>
             </div>
           </div>
         )}
 
-        {/* Single Winner / Auction Closed Notification Banner */}
-        {auctionClosed && !isTiedAtClose && displayedWinner && (
+        {/* Single Winner / Auction Closed Notification Banner (only after exact block Unix timestamp is resolved) */}
+        {auctionClosed && wasLiveBeforeClose && auctionFinalized && !isTiedAtClose && displayedWinner && (
           <div className="rounded-2xl bg-gradient-to-r from-emerald-950/80 via-slate-900 to-amber-950/50 border border-emerald-500/40 p-6 shadow-2xl relative overflow-hidden animate-fade-in">
             <div className="absolute -right-10 -bottom-10 w-60 h-60 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
             <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6 relative z-10">
@@ -1516,7 +1585,7 @@ export default function App() {
                 </div>
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400 font-mono uppercase tracking-wider mb-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" /> Auction Concluded at Block #{targetBlockNum}
+                    <CheckCircle2 className="w-3.5 h-3.5" /> Auction Concluded at Block {targetBlockNum}
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
                     Winning Bid Confirmed: {displayedWinner.amountSats.toLocaleString()} sats ({formatBtc(displayedWinner.amountSats)})
@@ -1524,31 +1593,34 @@ export default function App() {
                   <p className="text-sm text-slate-300 mt-1 break-words">
                     Winner Npub: <span className="font-mono text-amber-300">{truncatePubkey(displayedWinner.pubkey)}</span> · Event ID: <span className="font-mono text-slate-400 text-xs">{displayedWinner.id.substring(0, 16)}...</span>
                   </p>
-                  {wasLiveBeforeClose && winnerDisplayedAt && (
-                    <p className="text-[11px] text-slate-400 font-mono mt-1.5 break-words">
-                      Winner displayed: {new Date(winnerDisplayedAt).toLocaleString()} ({Intl.DateTimeFormat().resolvedOptions().timeZone})
+                  {closingBlockTimestamp !== null && (
+                    <p className="text-[11px] text-emerald-200/90 font-mono mt-1.5 break-words">
+                      Block {targetBlockNum.toLocaleString()} timestamp: {closingBlockTimestamp} ({new Date(closingBlockTimestamp * 1000).toLocaleString()} {localTz})
+                    </p>
+                  )}
+                  {liveWitnessedAt && (
+                    <p className="text-[11px] text-slate-400 font-mono mt-0.5 break-words">
+                      Live-witnessed WS arrival: {new Date(liveWitnessedAt).toLocaleString()} ({localTz})
                     </p>
                   )}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-3 shrink-0">
-                {wasLiveBeforeClose && (
-                  <button
-                    type="button"
-                    onClick={() => copyWinnerAnnouncement(displayedWinner, [])}
-                    className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
-                  >
-                    {copiedAnnouncement ? (
-                      <>
-                        <Check className="w-3.5 h-3.5" /> Copied Announcement!
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5" /> Copy Winner Announcement
-                      </>
-                    )}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => copyWinnerAnnouncement(displayedWinner, [])}
+                  className="flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-xl transition-colors shadow-lg shadow-amber-400/20 whitespace-nowrap cursor-pointer"
+                >
+                  {copiedAnnouncement ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" /> Copied Announcement!
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" /> Copy Winner Announcement
+                    </>
+                  )}
+                </button>
                 <a 
                   href={`https://njump.me/${encodeURIComponent(displayedWinner.id)}`} 
                   target="_blank" 
@@ -1602,7 +1674,7 @@ export default function App() {
                 <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/60">
                   <span className="text-xs text-slate-400 font-mono block mb-1">Closing Block Height</span>
                   <span className="text-lg font-bold text-amber-400 font-mono tabular-nums">
-                    #{targetBlockNum.toLocaleString()}
+                    {targetBlockNum.toLocaleString()}
                   </span>
                 </div>
 
@@ -1643,7 +1715,7 @@ export default function App() {
 
           </div>
 
-          {/* Right Col: Live Mempool.space Block Height Tracker */}
+          {/* Right Col: Mempool.space Block Height Tracker */}
           <div className="rounded-2xl bg-slate-900/80 border border-slate-800/80 p-6 flex flex-col justify-between shadow-xl">
             <div>
               <div className="flex items-center justify-between mb-4">
@@ -1672,7 +1744,7 @@ export default function App() {
               <div className="bg-slate-950/70 p-5 rounded-xl border border-slate-800/80 mb-4 text-center">
                 <span className="text-xs text-slate-400 font-mono block mb-1">Current Chain Tip</span>
                 <div className="text-3xl font-bold font-mono text-white tabular-nums tracking-tight">
-                  {currentBlockHeight !== null ? `#${currentBlockHeight.toLocaleString()}` : 'Syncing...'}
+                  {currentBlockHeight !== null ? `${currentBlockHeight.toLocaleString()}` : 'Syncing...'}
                 </div>
                 <div className="text-xs text-slate-400 mt-2 font-mono">
                   {currentBlockHeight === null ? (
@@ -1691,11 +1763,11 @@ export default function App() {
                   <span className="text-amber-400">wss://mempool.space/api/v1/ws</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Poll Interval</span>
+                  <span>Fallback (REST API) Poll Interval</span>
                   <span className="text-slate-200">{BLOCK_POLL_INTERVAL_MS / 1000}s</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>Last Synced</span>
+                  <span>Last Block / Stream Sync</span>
                   <span className="text-slate-200 tabular-nums">
                     {lastSyncedAt ? new Date(lastSyncedAt * 1000).toLocaleTimeString() : 'Never'}
                   </span>
@@ -1729,8 +1801,8 @@ export default function App() {
               </div>
               <p className="text-xs sm:text-sm text-amber-100/90 font-mono">
                 {isTiedAtClose
-                  ? `Tied winners marked at block #${targetBlockNum.toLocaleString()}. Set tiebreaking terms outside the nsite.`
-                  : `Live tie at ${tiedAmountSats.toLocaleString()} sats before block #${targetBlockNum.toLocaleString()}.`}
+                  ? `Tied winners marked at block ${targetBlockNum.toLocaleString()}. Set tiebreaking terms outside the nsite.`
+                  : `Live tie at ${tiedAmountSats.toLocaleString()} sats before block ${targetBlockNum.toLocaleString()}.`}
               </p>
               <div className="space-y-1.5 pt-1">
                 {activeTiedBids.map((tiedBid, idx) => (
@@ -1949,18 +2021,18 @@ export default function App() {
               <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-3 sm:p-4 space-y-2">
                 <div className="flex items-center gap-2 text-amber-400 font-bold text-xs sm:text-sm">
                   <span>⚠</span>
-                  <span>KEEP THIS TAB OPEN FOR LIVE-WITNESSED CLOSE</span>
+                  <span>KEEP THIS TAB FOCUSED IN FOREGROUND FOR LIVE-WITNESSED CLOSE</span>
                 </div>
                 <p className="text-xs text-amber-100/90 leading-relaxed">
-                  Nostr relay connections automatically reconnect in the background, so backgrounded tabs will still catch up on bids. However, to lock in <strong>Live-Witnessed</strong> finalization at the closing block, open the auction before close and keep this tab open and connected to Mempool until the block is mined.
+                  Nostr relay connections automatically reconnect in the background, so backgrounded tabs will still catch up on bids. However, to lock in <strong>Live-Witnessed</strong> finalization at the closing block, keep this tab visible and focused in the foreground when the Mempool WebSocket delivers the closing block.
                 </p>
                 <ul className="list-disc pl-5 space-y-1 text-xs text-amber-100/90 leading-relaxed">
-                  <li>Avoid closing or refreshing the tab around the closing block.</li>
-                  <li>Keep your browser running and your device awake near close.</li>
-                  <li>Check the Mempool WS status if the tab was sleeping.</li>
+                  <li>Keep this tab visible and focused (`visibilityState === 'visible'` and `hasFocus()`) when the closing block is mined.</li>
+                  <li>Avoid refreshing the tab around the closing block.</li>
+                  <li>Check the Mempool WS status so block events arrive live.</li>
                 </ul>
                 <p className="text-xs text-amber-200 font-semibold leading-relaxed">
-                  If you open or reload after the closing block is already mined, it cannot be marked Live-Witnessed and will show a historical caveat.
+                  If you open or reload after the closing block is already mined, or if the tab is not foreground-focused when the block arrives, it cannot be marked Live-Witnessed.
                 </p>
               </div>
 
@@ -2047,7 +2119,7 @@ export default function App() {
                   }}
                   className="w-full py-2 px-3 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-mono rounded-lg border border-amber-500/30 transition-colors text-left flex items-center justify-between cursor-pointer"
                 >
-                  <span>Test Event #{DEFAULT_TARGET_BLOCK} ({DEFAULT_STARTING_BID.toLocaleString()} sats)</span>
+                  <span>Test Event {DEFAULT_TARGET_BLOCK} ({DEFAULT_STARTING_BID.toLocaleString()} sats)</span>
                   <span className="text-amber-400">Load →</span>
                 </button>
               </div>
