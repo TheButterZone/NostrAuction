@@ -10,6 +10,7 @@ import {
   Settings2, CheckCircle2, ShieldAlert
 } from 'lucide-react';
 import { nip19 } from 'nostr-tools';
+import bitcoinSoundUrl from '../src/TheButterZone-NostrAuction.wav';
 
 interface Bid {
   id: string;
@@ -295,6 +296,69 @@ export default function App() {
   const [finalizedTiedWinners, setFinalizedTiedWinners] = useState<Bid[]>([]);
   const [winnerDisplayedAt, setWinnerDisplayedAt] = useState<string | null>(null);
   const [auctionFinalized, setAuctionFinalized] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(false);
+
+  const soundAudioRef = useRef<HTMLAudioElement | null>(null);
+  const lastFinalizedSoundRef = useRef<boolean>(false);
+
+  const getSoundAudio = useCallback(() => {
+    if (typeof window === 'undefined') return null;
+    if (!soundAudioRef.current) {
+      const audio = new Audio(bitcoinSoundUrl);
+      audio.preload = 'auto';
+      audio.volume = 1.0;
+      audio.addEventListener('error', () => {
+        console.warn("Audio failed to load or decode:", audio.error);
+      });
+      soundAudioRef.current = audio;
+    }
+    return soundAudioRef.current;
+  }, []);
+
+  const triggerSoundPlayback = useCallback((showAutoplayAlert: boolean) => {
+    const audio = getSoundAudio();
+    if (!audio) return;
+    try {
+      audio.currentTime = 0;
+      const playPromise = audio.play();
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch((err: any) => {
+          if (err?.name === 'NotAllowedError') {
+            console.warn("Autoplay blocked:", err);
+            if (showAutoplayAlert) {
+              window.alert("Browser autoplay policy blocked audio. Please click the sound toggle again or check site audio settings.");
+            }
+          } else {
+            console.warn("Audio playback error:", err);
+          }
+        });
+      }
+    } catch (e) {
+      console.warn("Audio error:", e);
+    }
+  }, [getSoundAudio]);
+
+  const handleToggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    if (next) {
+      triggerSoundPlayback(true);
+    } else if (soundAudioRef.current) {
+      soundAudioRef.current.pause();
+      soundAudioRef.current.currentTime = 0;
+    }
+  };
+
+  useEffect(() => {
+    if (!auctionFinalized || !wasLiveBeforeClose) {
+      lastFinalizedSoundRef.current = false;
+      return;
+    }
+    if (soundEnabled && !lastFinalizedSoundRef.current) {
+      lastFinalizedSoundRef.current = true;
+      triggerSoundPlayback(false);
+    }
+  }, [auctionFinalized, wasLiveBeforeClose, soundEnabled, triggerSoundPlayback]);
 
   // WebSocket & block-state refs
   const stopRelayConnectionsRef = useRef<(() => void) | null>(null);
@@ -362,6 +426,7 @@ export default function App() {
     setWinnerDisplayedAt(null);
     setAuctionFinalized(false);
     setClosingBlockTimestamp(null);
+    lastFinalizedSoundRef.current = false;
     const knownHeight = currentBlockHeightRef.current;
     const alreadyPastClosingBlock = knownHeight !== null && knownHeight >= targetBlockNum;
     setWasLiveBeforeClose(!alreadyPastClosingBlock);
@@ -1313,16 +1378,26 @@ export default function App() {
             </span>
           </div>
 
-          {/* Mobile/tablet button directly below logo/title, left-aligned */}
-          <button
-            type="button"
-            onClick={() => setShowTesterModal(true)}
-            disabled={auctionFinalized && wasLiveBeforeClose}
-            className="flex md:hidden items-center gap-2 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg shadow-amber-400/10 cursor-pointer"
-          >
-            <Settings2 className="w-3.5 h-3.5" />
-            Configure Auction
-          </button>
+          {/* Mobile/tablet button group directly below logo/title, left-aligned */}
+          <div className="flex md:hidden items-center gap-2">
+            <button
+              type="button"
+              onClick={handleToggleSound}
+              title={soundEnabled ? "Mute notification sound" : "Enable notification sound"}
+              className="px-2.5 py-1.5 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+            >
+              {soundEnabled ? '🔔' : '🔕'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowTesterModal(true)}
+              disabled={auctionFinalized && wasLiveBeforeClose}
+              className="flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors shadow-lg shadow-amber-400/10 cursor-pointer"
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+              Configure Auction
+            </button>
+          </div>
         </div>
 
         {/* Desktop navigation links */}
@@ -1335,6 +1410,14 @@ export default function App() {
 
         {/* Desktop action button */}
         <div className="hidden md:flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={handleToggleSound}
+            title={soundEnabled ? "Mute notification sound" : "Enable notification sound"}
+            className="px-3 py-2 text-xs rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer"
+          >
+            {soundEnabled ? '🔔' : '🔕'}
+          </button>
           <button 
             type="button"
             onClick={() => setShowTesterModal(true)}
